@@ -1,5 +1,9 @@
 # HyperDistill (MetaMorph teacher): HD0
 
+Update: the user subsequently confirmed real-server **HD0_FINAL=PASS**.
+The local-only limitations below describe the original implementation handoff.
+The next reduced protocol is documented in `HYPERDISTILL_HD1.md`.
+
 This is teacher substitution, **not original HyperDistill reproduction**. The
 official `HNMLP` architecture is unchanged. RMAMorph alone loads and runs the
 teacher; the two repositories run in separate processes because both import

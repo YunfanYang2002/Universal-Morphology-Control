@@ -54,7 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=1409)
     parser.add_argument("--student-policy", type=Path, help="optional frozen TorchScript policy accepting [1, selected_columns]")
+    parser.add_argument("--student-policy-dir", type=Path, help="HD1 directory containing <walker_id>.ts policies")
     parser.add_argument("--student-columns", type=Path, help="JSON list of flattened normalized proprioceptive column indices")
+    parser.add_argument("--hd1-selection", type=Path, help="HD1 parent-selected JSON inventory")
+    parser.add_argument("--hd1-set", choices=("train", "train_smoke", "ood_smoke"), help="selection list to export")
+    parser.add_argument("--teacher-reference", type=Path, help="existing HD1 teacher export used for student-only evaluation")
     return parser.parse_args()
 
 
@@ -184,12 +188,64 @@ def load_student_columns(path: Path, proprio_dim: int) -> np.ndarray:
     return columns
 
 
+def load_hd1_selection(path: Path, set_name: str, config_walkers: list[str]) -> list[dict[str, Any]]:
+    selection = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(selection, dict) or not isinstance(selection.get(set_name), list):
+        raise ValueError(f"HD1 selection lacks a list for {set_name}")
+    sources = selection.get("sources")
+    if not isinstance(sources, dict):
+        raise ValueError("HD1 selection lacks sources provenance")
+    for path_key, hash_key in (("teacher_config", "teacher_config_sha256"), ("ood_pool", "ood_pool_sha256")):
+        source = require_file(Path(sources.get(path_key, "")), f"HD1 source {path_key}")
+        if sources.get(hash_key) != sha256_file(source):
+            raise ValueError(f"HD1 source hash mismatch: {path_key}")
+    ood_ids = {line.strip() for line in Path(sources["ood_pool"]).read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith("#")}
+    rows = selection[set_name]
+    if not rows:
+        raise ValueError(f"HD1 selection {set_name} is empty")
+    walkers: set[str] = set()
+    xml_parents: set[Path] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("HD1 selection rows must be objects")
+        walker = row.get("walker_id")
+        if not isinstance(walker, str) or not walker or walker in walkers:
+            raise ValueError("HD1 selection walker_id values must be nonempty and unique")
+        walkers.add(walker)
+        xml = require_file(Path(row.get("xml_path", "")), f"HD1 XML ({walker})")
+        metadata = require_file(Path(row.get("metadata_path", "")), f"HD1 metadata ({walker})")
+        if xml.name != walker + ".xml" or metadata.name != walker + ".json":
+            raise ValueError(f"HD1 provenance paths do not match walker_id {walker}")
+        if row.get("xml_sha256") != sha256_file(xml) or row.get("metadata_sha256") != sha256_file(metadata):
+            raise ValueError(f"HD1 provenance hash mismatch for {walker}")
+        if bool(row.get("in_teacher_training")) != (walker in config_walkers) or bool(row.get("in_frozen_ood")) != (walker in ood_ids):
+            raise ValueError(f"HD1 membership flags do not match frozen sources for {walker}")
+        xml_parents.add(xml.parent.parent.resolve())
+    if len(xml_parents) != 1:
+        raise ValueError("all selected HD1 walkers must share one native walker directory")
+    if set_name in ("train", "train_smoke") and not walkers.issubset(set(config_walkers)):
+        raise ValueError("HD1 train selection contains a walker outside the Teacher training configuration")
+    if set_name == "ood_smoke" and walkers.intersection(config_walkers):
+        raise ValueError("HD1 OOD selection contains a Teacher-training walker")
+    if set_name == "ood_smoke" and not walkers.issubset(ood_ids):
+        raise ValueError("HD1 OOD selection contains a walker outside the frozen OOD pool")
+    return rows
+
+
 def main() -> None:
     args = parse_args()
     if args.episodes <= 0 or args.max_steps <= 0:
         raise ValueError("--episodes and --max-steps must be positive")
-    if bool(args.student_policy) != bool(args.student_columns):
-        raise ValueError("--student-policy and --student-columns must be supplied together")
+    if bool(args.hd1_selection) != bool(args.hd1_set):
+        raise ValueError("--hd1-selection and --hd1-set must be supplied together")
+    if args.student_policy and args.student_policy_dir:
+        raise ValueError("use either --student-policy or --student-policy-dir")
+    if bool(args.student_policy or args.student_policy_dir) != bool(args.student_columns):
+        raise ValueError("a student policy source and --student-columns must be supplied together")
+    if args.teacher_reference and not args.student_policy_dir:
+        raise ValueError("--teacher-reference is only supported with --student-policy-dir")
+    if args.hd1_selection and (args.episodes != 3 or args.max_steps != 3000):
+        raise ValueError("HD1 requires exactly --episodes 3 and --max-steps 3000")
 
     root = args.rmamorph_root.resolve()
     if not (root / "metamorph" / "config.py").is_file():
@@ -229,16 +285,29 @@ def main() -> None:
     cfg.DYNAMICS.MOTOR_STRENGTH_RANGE = [1.0, 1.0]
     cfg.DYNAMICS.FRICTION_RANGE = [1.0, 1.0]
     cfg.DYNAMICS.MASS_RANGE = [1.0, 1.0]
-    walkers = list(args.walkers) if args.walkers else list(cfg.ENV.WALKERS[:3])
-    if len(walkers) != 3 or len(set(walkers)) != 3:
-        raise ValueError("export requires exactly three distinct walkers")
-    if not set(walkers).issubset(set(cfg.ENV.WALKERS)):
-        raise ValueError("HD0 walkers must belong to the checkpoint config training set")
-    walker_selection = "explicit --walkers" if args.walkers else "first three cfg.ENV.WALKERS"
-    walker_dir = (root / "output" / "unimals_100" / "train").resolve()
+    hd1_rows = None
+    if args.hd1_selection:
+        hd1_selection_path = resolve(root, args.hd1_selection)
+        hd1_rows = load_hd1_selection(hd1_selection_path, args.hd1_set, list(cfg.ENV.WALKERS))
+        hd1_sources = json.loads(hd1_selection_path.read_text(encoding="utf-8"))["sources"]
+        if Path(hd1_sources["teacher_config"]).resolve() != config or hd1_sources["teacher_config_sha256"] != sha256_file(config):
+            raise ValueError("HD1 selection is not bound to the current Teacher config")
+        walkers = [row["walker_id"] for row in hd1_rows]
+        walker_selection = f"HD1 {args.hd1_set} selection"
+        walker_paths = [Path(row["xml_path"]).resolve() for row in hd1_rows]
+        metadata_paths = [Path(row["metadata_path"]).resolve() for row in hd1_rows]
+        walker_dir = walker_paths[0].parent.parent
+    else:
+        walkers = list(args.walkers) if args.walkers else list(cfg.ENV.WALKERS[:3])
+        if len(walkers) != 3 or len(set(walkers)) != 3:
+            raise ValueError("HD0 export requires exactly three distinct walkers")
+        if not set(walkers).issubset(set(cfg.ENV.WALKERS)):
+            raise ValueError("HD0 walkers must belong to the checkpoint config training set")
+        walker_selection = "explicit --walkers" if args.walkers else "first three cfg.ENV.WALKERS"
+        walker_dir = (root / "output" / "unimals_100" / "train").resolve()
+        walker_paths = [require_file(walker_dir / "xml" / f"{walker}.xml", f"walker XML ({walker})") for walker in walkers]
+        metadata_paths = [require_file(walker_dir / "metadata" / f"{walker}.json", f"walker metadata ({walker})") for walker in walkers]
     cfg.ENV.WALKER_DIR = str(walker_dir)
-    walker_paths = [require_file(walker_dir / "xml" / f"{walker}.xml", f"walker XML ({walker})") for walker in walkers]
-    metadata_paths = [require_file(walker_dir / "metadata" / f"{walker}.json", f"walker metadata ({walker})") for walker in walkers]
 
     device = torch.device(cfg.DEVICE if torch.cuda.is_available() else "cpu")
     cfg.DEVICE = str(device)
@@ -264,6 +333,7 @@ def main() -> None:
         raise ValueError("Invalid checkpoint RMS statistics")
 
     student = None
+    student_by_walker: dict[str, Any] = {}
     student_columns = None
     student_sha = None
     if args.student_policy:
@@ -272,6 +342,129 @@ def main() -> None:
         student_columns = load_student_columns(columns_path, proprio_dim)
         student = torch.jit.load(str(policy_path), map_location=device).eval()
         student_sha = sha256_file(policy_path)
+    if args.student_policy_dir:
+        policy_dir = resolve(root, args.student_policy_dir)
+        if not policy_dir.is_dir():
+            raise FileNotFoundError(f"student policy directory is missing: {policy_dir}")
+        columns_path = require_file(resolve(root, args.student_columns), "student columns")
+        student_columns = load_student_columns(columns_path, proprio_dim)
+        for walker in walkers:
+            policy_path = require_file(policy_dir / f"{walker}.ts", f"student policy ({walker})")
+            student_by_walker[walker] = torch.jit.load(str(policy_path), map_location=device).eval()
+
+    if args.teacher_reference:
+        reference = resolve(root, args.teacher_reference)
+        reference_manifest_path = require_file(reference / "manifest.json", "teacher reference manifest")
+        reference_manifest = json.loads(reference_manifest_path.read_text(encoding="utf-8"))
+        if reference_manifest.get("walkers") != walkers or reference_manifest.get("episode_count") != len(walkers) * 3:
+            raise ValueError("teacher reference does not bind exactly the selected HD1 walkers and three episodes each")
+        if reference_manifest.get("sha256", {}).get("config") != sha256_file(config) or reference_manifest.get("sha256", {}).get("checkpoint") != sha256_file(checkpoint):
+            raise ValueError("teacher reference config/checkpoint hash differs from current invocation")
+        if reference_manifest.get("hd1_selection") != hd1_rows:
+            raise ValueError("teacher reference selection provenance differs from current HD1 selection")
+        if any(reference_manifest.get(key) != "PASS" for key in ("METAMORPH_TEACHER_LOAD", "TEACHER_OBS_FINITE", "TEACHER_ACTION_FINITE", "MORPH_CONTEXT_BINDING")):
+            raise ValueError("teacher reference lacks required PASS gates")
+        reference_arrays = require_file(reference / "arrays.npz", "teacher reference arrays")
+        with np.load(reference_arrays, allow_pickle=False) as reference_data:
+            reference_contexts = np.array(reference_data["context_raw"], dtype=np.float32, copy=True)
+            reference_walker_indices = np.array(reference_data["walker_index"], copy=True)
+            reference_episode_ids = np.array(reference_data["episode_id"], copy=True)
+            reference_obs_masks = np.array(reference_data["obs_padding_mask"], dtype=bool, copy=True)
+            reference_act_masks = np.array(reference_data["act_padding_mask"], dtype=bool, copy=True)
+        from convert_rmamorph_teacher_to_hyperdistill import nominal_context
+        export_stats = json.loads(require_file(resolve(root, args.student_policy_dir) / "hd1_export_stats.json", "HD1 student export stats").read_text(encoding="utf-8"))
+        export_bindings = {row.get("walker_id"): row.get("context_sha256") for row in export_stats.get("exports", []) if isinstance(row, dict)}
+        policy_bindings = {row["walker_id"]: row["policy_sha256"] for row in export_stats["exports"]}
+        for walker_index, walker in enumerate(walkers):
+            if policy_bindings[walker] != sha256_file(resolve(root, args.student_policy_dir) / f"{walker}.ts"):
+                raise ValueError(f"student TorchScript file hash mismatch for {walker}")
+            rows = np.flatnonzero(reference_walker_indices == walker_index)
+            if rows.size == 0:
+                raise ValueError(f"teacher reference lacks rows for {walker}")
+            episode = int(reference_episode_ids[rows[0]])
+            expected_context = nominal_context(reference_contexts[episode], reference_obs_masks[rows[0]], reference_act_masks[rows[0]])
+            if export_bindings.get(walker) != hashlib.sha256(expected_context.tobytes()).hexdigest():
+                raise ValueError(f"student TorchScript context binding mismatch for {walker}")
+        metrics_rows = []
+        for walker_index, walker in enumerate(walkers):
+            cfg.ENV.WALKERS = [walker]
+            cfg.RNG_SEED = int(args.seed) + walker_index
+            su.set_seed(cfg.RNG_SEED)
+            env = make_vec_envs(training=False, norm_rew=False, num_env=1)
+            apply_ob_rms(env, ob_rms)
+            student_returns: list[float] = []
+            student_lengths: list[int] = []
+            student_displacements: list[float] = []
+            reasons: list[str] = []
+            squared_errors: list[np.ndarray] = []
+            try:
+                raw_env = base_env(env)
+                obs = env.reset()
+                expected_episodes = np.unique(reference_episode_ids[reference_walker_indices == walker_index])
+                if expected_episodes.size != 3:
+                    raise ValueError(f"teacher reference lacks exactly three reset contexts for {walker}")
+                if not np.array_equal(native_raw_context(raw_env, max_limbs), reference_contexts[int(expected_episodes[0])]):
+                    raise ValueError(f"student reset context differs from frozen teacher context for {walker} episode 0")
+                start_x = float(raw_env.sim.data.qpos[0])
+                steps = completed = 0
+                while completed < 3:
+                    if steps >= 3000:
+                        raise RuntimeError(f"student HD1 walker {walker} completed only {completed}/3 episodes within 3000 steps")
+                    proprio = tensor_to_numpy(obs["proprioceptive"])[0].astype(np.float32, copy=False)
+                    if not np.isfinite(proprio).all():
+                        raise FloatingPointError("Nonfinite HD1 student observation")
+                    act_mask = tensor_to_numpy(obs["act_padding_mask"])[0].astype(bool, copy=False)
+                    with torch.no_grad():
+                        _, teacher_distribution, _, _ = teacher(obs)
+                        teacher_mean = tensor_to_numpy(teacher_distribution.mean)[0].astype(np.float32, copy=False)
+                        student_input = torch.as_tensor(proprio[student_columns], dtype=torch.float32, device=device).unsqueeze(0)
+                        student_action = tensor_to_numpy(student_by_walker[walker](student_input))[0].astype(np.float32, copy=True)
+                    if student_action.shape != (action_dim,) or not (np.isfinite(student_action).all() and np.isfinite(teacher_mean).all()):
+                        raise FloatingPointError("nonfinite or mis-shaped HD1 student action")
+                    if np.any(student_action[act_mask] != 0.0):
+                        raise ValueError("frozen HD1 student policy emitted nonzero padded actions")
+                    valid, low, high = policy_action_spec(raw_env.action_space.low, raw_env.action_space.high, act_mask, None)
+                    canonical_student = canonicalize_executed_action(student_action, valid, low, high).astype(np.float32, copy=False)
+                    squared_errors.append((student_action[~act_mask] - teacher_mean[~act_mask]) ** 2)
+                    obs, rewards, dones, infos = env.step(torch.as_tensor(canonical_student, device=device).unsqueeze(0))
+                    if not np.isfinite(tensor_to_numpy(rewards)).all() or infos[0].get("mj_step_error"):
+                        raise FloatingPointError("HD1 student rollout numerical failure")
+                    steps += 1
+                    if bool(dones[0]):
+                        episode = infos[0].get("episode")
+                        if episode is None or "x_pos" not in infos[0] or int(episode["l"]) > 1000:
+                            raise RuntimeError("HD1 terminal transition lacks episode/x_pos evidence")
+                        if not np.isfinite([episode["r"], episode["l"], infos[0]["x_pos"], start_x]).all():
+                            raise FloatingPointError("Nonfinite HD1 terminal metrics")
+                        student_returns.append(float(episode["r"]))
+                        student_lengths.append(int(episode["l"]))
+                        student_displacements.append(float(infos[0]["x_pos"]) - start_x)
+                        reasons.append("horizon" if infos[0].get("timeout") else "early_termination")
+                        completed += 1
+                        if completed < 3:
+                            if not np.array_equal(native_raw_context(raw_env, max_limbs), reference_contexts[int(expected_episodes[completed])]):
+                                raise ValueError(f"student reset context differs from frozen teacher context for {walker} episode {completed}")
+                            start_x = float(raw_env.sim.data.qpos[0])
+            finally:
+                env.close()
+            start = walker_index * 3
+            teacher_records = reference_manifest["teacher_episode_records"][start:start + 3]
+            metrics_rows.append({"walker_id": walker,
+                                 "teacher_episode_returns": reference_manifest["teacher_episode_returns"][start:start + 3],
+                                 "teacher_episode_lengths": reference_manifest["teacher_episode_lengths"][start:start + 3],
+                                 "student_episode_returns": student_returns, "student_episode_lengths": student_lengths,
+                                 "student_forward_displacements": student_displacements, "termination_reasons": reasons,
+                                 "teacher_forward_displacements": [r["forward_displacement"] for r in teacher_records],
+                                 "teacher_termination_reasons": [r["termination_reason"] for r in teacher_records],
+                                 "student_early_terminations": sum(r == "early_termination" for r in reasons),
+                                 "fall_classification": "NOT_MEASURED; early termination is not relabelled as a diagnosed fall",
+                                 "numerical_failures": 0, "action_mse_valid": float(np.concatenate(squared_errors).mean())})
+        output.mkdir(parents=True)
+        metrics = {"schema_version": 1, "teacher_reference": str(reference), "teacher_reference_manifest_sha256": sha256_file(reference_manifest_path), "per_walker": metrics_rows,
+                   "student_rollout_finite": True, "STUDENT_EVALUATION": "PASS"}
+        (output / "rollout_metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps({"output": str(output), "student_evaluation": "PASS"}, sort_keys=True))
+        return
 
     transitions: dict[str, list[np.ndarray]] = {key: [] for key in (
         "proprio_normalized", "action_mean", "action_canonical", "episode_id", "step_id", "walker_index", "obs_padding_mask", "act_padding_mask", "adjacency"
@@ -279,6 +472,7 @@ def main() -> None:
     contexts: list[np.ndarray] = []
     returns: list[float] = []
     lengths: list[int] = []
+    teacher_episode_records: list[dict[str, Any]] = []
     student_squared_errors: list[np.ndarray] = []
     episode_id = 0
     order_bindings = {}
@@ -291,6 +485,7 @@ def main() -> None:
         try:
             raw_env = base_env(env)
             obs = env.reset()
+            episode_start_x = float(raw_env.sim.data.qpos[0])
             contexts.append(native_raw_context(raw_env, max_limbs))
             agent = raw_env.modules["Agent"]
             order_bindings[walker] = {
@@ -346,15 +541,22 @@ def main() -> None:
                 episode_step += 1
                 if bool(dones[0]):
                     episode = infos[0].get("episode")
-                    if episode is None:
+                    if episode is None or int(episode["l"]) > 1000:
                         raise RuntimeError("native done transition lacks RecordEpisodeStatistics episode record")
                     returns.append(float(episode["r"]))
                     lengths.append(int(episode["l"]))
+                    if "x_pos" not in infos[0]:
+                        raise RuntimeError("HD1/HD0 terminal transition lacks native x_pos")
+                    teacher_episode_records.append({"walker_id": walker, "return": float(episode["r"]), "length": int(episode["l"]),
+                                                    "forward_displacement": float(infos[0]["x_pos"]) - episode_start_x,
+                                                    "termination_reason": "horizon" if infos[0].get("timeout") else "early_termination",
+                                                    "numerical_failures": 0})
                     episode_id += 1
                     completed += 1
                     episode_step = 0
                     if completed < args.episodes:
                         contexts.append(native_raw_context(raw_env, max_limbs))
+                        episode_start_x = float(raw_env.sim.data.qpos[0])
         finally:
             env.close()
 
@@ -397,7 +599,7 @@ def main() -> None:
                 steps += 1
                 if bool(dones[0]):
                     episode = infos[0].get("episode")
-                    if episode is None:
+                    if episode is None or int(episode["l"]) > 1000:
                         raise RuntimeError("student done transition lacks episode record")
                     student_returns.append(float(episode["r"]))
                     student_lengths.append(int(episode["l"]))
@@ -431,9 +633,11 @@ def main() -> None:
         "per_limb_obs_labels": per_limb_labels,
         "proprio_feature_labels": [f"limb{limb}/{label}" for limb in range(max_limbs) for label in per_limb_labels],
         "walkers": walkers,
+        "hd1_selection": hd1_rows,
         "order_bindings": order_bindings,
         "teacher_episode_returns": returns,
         "teacher_episode_lengths": lengths,
+        "teacher_episode_records": teacher_episode_records,
         "walker_selection": walker_selection,
         "episode_count": episode_id,
         "transition_count": int(arrays["episode_id"].size),

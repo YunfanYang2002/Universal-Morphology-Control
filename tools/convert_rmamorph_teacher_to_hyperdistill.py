@@ -47,7 +47,7 @@ def nominal_context(raw, obs_mask, act_mask):
     return out.astype(np.float32).ravel()
 
 
-def convert(source, output):
+def convert(source, output, expected_walkers=None):
     source, output = Path(source), Path(output)
     manifest = json.loads((source / "manifest.json").read_text())
     assert manifest["context_format"] == "raw_v1"
@@ -68,7 +68,10 @@ def convert(source, output):
         rms = {"mean": data["rms_mean"][columns], "var": data["rms_var"][columns],
                "count": data["rms_count"].copy()}
         np.savez(output / "selected_obs_rms.npz", **rms)
-        assert len(manifest["walkers"]) == 3, "HD0 export requires exactly three training walkers"
+        if expected_walkers is None:
+            assert len(manifest["walkers"]) == 3, "HD0 export requires exactly three training walkers"
+        else:
+            assert list(manifest["walkers"]) == list(expected_walkers), "HD1 walker order differs from selected inventory"
         for walker_index, walker in enumerate(manifest["walkers"]):
             assert Path(walker).name == walker and walker not in (".", "..")
             rows = np.flatnonzero(data["walker_index"] == walker_index)
@@ -129,5 +132,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--expected-walkers", help="optional JSON list for HD1 selected walker order")
     args = parser.parse_args()
-    convert(args.source, args.output)
+    expected = None if args.expected_walkers is None else json.loads(args.expected_walkers)
+    if expected is not None and (not isinstance(expected, list) or not all(isinstance(value, str) for value in expected)):
+        raise ValueError("--expected-walkers must be a JSON list of walker IDs")
+    convert(args.source, args.output, expected_walkers=expected)
