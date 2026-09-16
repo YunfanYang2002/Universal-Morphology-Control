@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--walker-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--expected-pd-robots", type=int, default=10)
+    parser.add_argument("--resume", action="store_true", help="reuse only hash-verified complete per-robot shards")
     return parser.parse_args()
 
 
@@ -145,42 +147,102 @@ def collect_one(runtime, entry, destination):
     if len(arrays["proprio_normalized"]) != 8000:
         raise AssertionError("HD2 collector must truncate exactly at 8000")
     np.savez_compressed(destination, **arrays)
-    return {"pd_robot_id": entry["pd_robot_id"], "transition_count": 8000, "episode_count_required_to_reach_8000": len(episodes),
-            "teacher_return_distribution": return_values, "episode_length_distribution": lengths, "early_termination_count": early,
-            "shard_sha256": sha256(destination)}
+    completed_episode_count = len(episodes)
+    final_partial_episode_steps = 8000 - sum(lengths)
+    if final_partial_episode_steps < 0 or sum(lengths) + final_partial_episode_steps != 8000:
+        raise AssertionError("HD2 completed and final-partial episode accounting must equal exactly 8000 transitions")
+    return {"pd_robot_id": entry["pd_robot_id"], "transition_count": 8000,
+            # Legacy field is retained for readers of historical HD2A artifacts only.
+            "episode_count_required_to_reach_8000": completed_episode_count,
+            "episode_count_required_to_reach_8000_semantics": "DEPRECATED: completed terminal episodes only; use episodes_started",
+            "completed_episode_count": completed_episode_count,
+            "completed_episode_length_distribution": lengths,
+            "final_partial_episode_steps": final_partial_episode_steps,
+            "episodes_started": completed_episode_count + int(final_partial_episode_steps > 0),
+            "teacher_return_distribution": return_values,
+            "episode_length_distribution": lengths,
+            "early_termination_count": early, "shard_sha256": sha256(destination)}
 
 
 def teacher_coverage_summary(metrics):
     """Cost/coverage audit only; no morphology filtering or collection-policy change."""
     per_robot = []
     for row in metrics:
-        lengths = np.asarray(row["episode_length_distribution"], dtype=np.float64)
+        lengths = np.asarray(row["completed_episode_length_distribution"], dtype=np.float64)
         returns = np.asarray(row["teacher_return_distribution"], dtype=np.float64)
-        episodes = int(row["episode_count_required_to_reach_8000"])
-        per_robot.append({"pd_robot_id": row["pd_robot_id"], "episode_count_to_8000": episodes,
+        completed = int(row["completed_episode_count"])
+        partial = int(row["final_partial_episode_steps"])
+        if completed <= 0 or int(lengths.sum()) + partial != int(row["transition_count"]):
+            raise ValueError(f"HD2 invalid completed/final-partial accounting: {row['pd_robot_id']}")
+        per_robot.append({"pd_robot_id": row["pd_robot_id"], "episodes_started": int(row["episodes_started"]),
+                          "completed_episode_count": completed,
                           "early_termination_count": int(row["early_termination_count"]),
-                          "early_termination_fraction": float(row["early_termination_count"] / episodes),
-                          "median_episode_length": float(np.median(lengths)),
+                          "early_termination_fraction": float(row["early_termination_count"] / completed),
+                          "completed_episode_length_median": float(np.median(lengths)),
+                          "final_partial_episode_steps": partial,
                           "teacher_return_mean": float(np.mean(returns)), "teacher_return_median": float(np.median(returns))})
     def quantiles(values):
         return {f"p{percent}": float(np.percentile(values, percent)) for percent in (50, 90, 95, 99)} | {"max": float(np.max(values))}
+    def quantiles_with_minimum(values):
+        return quantiles(values) | {"min": float(np.min(values))}
     return {"collection_policy": "audit_only_no_filtering", "per_pd_robot": per_robot,
-            "episode_count_to_8000": quantiles([row["episode_count_to_8000"] for row in per_robot]),
+            "episodes_started": quantiles([row["episodes_started"] for row in per_robot]),
             "early_termination_fraction": quantiles([row["early_termination_fraction"] for row in per_robot]),
-            "median_episode_length": quantiles([row["median_episode_length"] for row in per_robot]),
+            "completed_episode_length_median": quantiles_with_minimum([row["completed_episode_length_median"] for row in per_robot]),
+            "final_partial_episode_steps": quantiles([row["final_partial_episode_steps"] for row in per_robot]),
             "teacher_return_mean": quantiles([row["teacher_return_mean"] for row in per_robot])}
+
+
+def _verified_existing_collection(output: Path, entries: list[dict]) -> dict:
+    metrics_path = output / "collection_metrics.json"
+    if not metrics_path.is_file():
+        return {}
+    rows = json.loads(metrics_path.read_text()).get("per_robot", [])
+    expected = {entry["pd_robot_id"] for entry in entries}
+    existing = {row.get("pd_robot_id"): row for row in rows}
+    if not set(existing).issubset(expected):
+        raise ValueError("HD2 resume collection contains a PD robot outside the frozen manifest")
+    for pd_robot_id, row in existing.items():
+        shard = output / f"{pd_robot_id}.npz"
+        if row.get("transition_count") != 8000 or not shard.is_file() or row.get("shard_sha256") != sha256(shard):
+            raise ValueError(f"HD2 resume collection shard is incomplete or hash-mismatched: {pd_robot_id}")
+        lengths = row.get("completed_episode_length_distribution", row.get("episode_length_distribution"))
+        if lengths is None:
+            raise ValueError(f"HD2 resume collection lacks episode lengths: {pd_robot_id}")
+        partial = int(row.get("final_partial_episode_steps", 8000 - sum(lengths)))
+        if sum(lengths) + partial != 8000:
+            raise ValueError(f"HD2 resume collection episode accounting is invalid: {pd_robot_id}")
+        row.setdefault("completed_episode_count", len(lengths))
+        row.setdefault("completed_episode_length_distribution", lengths)
+        row.setdefault("final_partial_episode_steps", partial)
+        row.setdefault("episodes_started", len(lengths) + int(partial > 0))
+        row.setdefault("episode_count_required_to_reach_8000_semantics", "DEPRECATED: completed terminal episodes only; use episodes_started")
+    return existing
 
 
 def main():
     args = parse_args(); runtime = _configure(args); entries = json.loads(args.manifest.read_text(encoding="utf-8"))
-    if len(entries) != 10 or len({entry["pd_robot_id"] for entry in entries}) != 10:
-        raise ValueError("HD2A must receive exactly ten unique PD robots")
+    if args.expected_pd_robots <= 0 or len(entries) != args.expected_pd_robots or len({entry["pd_robot_id"] for entry in entries}) != args.expected_pd_robots:
+        raise ValueError(f"HD2 must receive exactly {args.expected_pd_robots} unique PD robots")
     if args.command == "validate":
+        if args.resume:
+            raise ValueError("--resume is valid only for teacher collection")
         result = validate(runtime, entries, args.output)
     else:
-        args.output.mkdir(parents=True, exist_ok=False)
-        metrics = [collect_one(runtime, entry, args.output / f"{entry['pd_robot_id']}.npz") for entry in entries]
-        result = {"HD2A_EXACT_8000": "PASS", "HD2A_TOTAL_TRANSITIONS": sum(row["transition_count"] for row in metrics), "per_robot": metrics}
+        if args.output.exists():
+            if not args.resume:
+                raise FileExistsError(f"HD2 collection output already exists: {args.output}")
+        else:
+            args.output.mkdir(parents=True, exist_ok=False)
+        existing = _verified_existing_collection(args.output, entries) if args.resume else {}
+        metrics = [existing.get(entry["pd_robot_id"]) or collect_one(runtime, entry, args.output / f"{entry['pd_robot_id']}.npz") for entry in entries]
+        label = "HD2A" if args.expected_pd_robots == 10 else "HD2B"
+        total = 8000 * args.expected_pd_robots
+        if sum(row["transition_count"] for row in metrics) != total:
+            raise AssertionError("HD2 collection total transitions differs from the exact frozen contract")
+        result = {f"{label}_EXACT_8000": "PASS", f"{label}_TOTAL_TRANSITIONS": total, "per_robot": metrics}
+        if label == "HD2B":
+            result["HD2B_RESUMABLE_COLLECTION"] = "PASS"
         (args.output / "collection_metrics.json").write_text(json.dumps(result, indent=2) + "\n")
         (args.output / "teacher_coverage_summary.json").write_text(json.dumps(teacher_coverage_summary(metrics), indent=2) + "\n")
     print(json.dumps(result, sort_keys=True))

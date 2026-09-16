@@ -77,16 +77,39 @@ def official_epoch_batch_plan(samples: int, batch_size: int) -> dict:
             "optimizer_steps": full_batches + int(final_batch != 0)}
 
 
-def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, hd1_columns: Path) -> dict:
+def epoch_batch_sizes(samples: int, batch_size: int) -> list[int]:
+    """Paper-faithful epoch partition: final short batch is an optimizer step."""
+    plan = official_epoch_batch_plan(samples, batch_size)
+    return [batch_size] * plan["full_batches"] + ([plan["final_batch_size"]] if plan["final_batch_size"] else [])
+
+
+def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, hd1_columns: Path, *, resume: bool = False, label: str = "HD2A") -> dict:
     """Convert one 8k NPZ per PD robot; each pickle is self-contained and reload-checked."""
     expert_dir, converted_dir = Path(expert_dir), Path(converted_dir)
     entries = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     frozen_columns, frozen_bytes = load_frozen_hd1_columns(hd1_columns)
-    converted_dir.mkdir(parents=True, exist_ok=False)
-    write_frozen_student_columns(converted_dir, frozen_bytes)
-    bytes_on_disk = 0
+    if converted_dir.exists():
+        if not resume:
+            raise FileExistsError(f"HD2 converted output already exists: {converted_dir}")
+        columns_path = converted_dir / "student_columns.json"
+        if not columns_path.is_file() or columns_path.read_bytes() != frozen_bytes:
+            raise ValueError("HD2 resume conversion mapper differs from the frozen HD1 mapper")
+    else:
+        converted_dir.mkdir(parents=True, exist_ok=False)
+        write_frozen_student_columns(converted_dir, frozen_bytes)
     for entry in entries:
         source = expert_dir / f"{entry['pd_robot_id']}.npz"
+        destination = converted_dir / f"{entry['pd_robot_id']}.pkl"
+        if destination.exists():
+            if not resume:
+                raise FileExistsError(f"HD2 converted shard already exists: {destination}")
+            with destination.open("rb") as stream:
+                payload = pickle.load(stream)
+            provenance = payload.get("manifest", {})
+            if (provenance.get("pd_robot_id") != entry["pd_robot_id"] or provenance.get("source_sha256") != sha256(source)
+                    or len(payload.get("obs", ())) != 8000):
+                raise ValueError(f"HD2 resume conversion shard is invalid: {entry['pd_robot_id']}")
+            continue
         with np.load(source, allow_pickle=False) as data:
             max_limbs = int(data["max_limbs"].item())
             teacher_obs = data["proprio_normalized"]
@@ -106,19 +129,17 @@ def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, h
                        "manifest": {"context_version": 1, "proprio_features_per_limb": 17, "max_limbs": max_limbs,
                                     "normalization": "teacher_obs_rms_then_selected", "pd_robot_id": entry["pd_robot_id"],
                                     "parent_walker_id": entry["parent_walker_id"], "parent_family": entry["parent_family"], "source_sha256": sha256(source)}}
-        destination = converted_dir / f"{entry['pd_robot_id']}.pkl"
         with destination.open("wb") as stream:
             pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
         with destination.open("rb") as stream:
             reloaded = pickle.load(stream)
         if not torch.equal(payload["obs"], reloaded["obs"]):
             raise RuntimeError(f"HD2 shard reload mismatch: {entry['pd_robot_id']}")
-        bytes_on_disk += destination.stat().st_size
     shard_artifacts = []
     for entry in entries:
         path = converted_dir / f"{entry['pd_robot_id']}.pkl"
         shard_artifacts.append({"pd_robot_id": entry["pd_robot_id"], "bytes": path.stat().st_size, "sha256": sha256(path)})
-    report = {"HD2A_SHARDED_DATASET": "PASS", "HD2A_MAPPER_IDENTITY": "PASS", "dataset_bytes_on_disk": bytes_on_disk,
+    report = {f"{label}_SHARDED_DATASET": "PASS", f"{label}_MAPPER_IDENTITY": "PASS", "dataset_bytes_on_disk": sum(row["bytes"] for row in shard_artifacts),
               "shard_count": len(entries), "student_columns_sha256": FROZEN_HD1_COLUMNS_SHA256,
               "FROZEN_HD1_COLUMNS_LENGTH": FROZEN_HD1_COLUMN_COUNT, "FROZEN_HD1_COLUMNS_HASH": "PASS",
               "HD2_CONVERTER_USES_FROZEN_COLUMNS": "PASS", "HD2_CONVERTER_DOES_NOT_DERIVE_FIRST_17_PER_LIMB": "PASS",
@@ -148,6 +169,48 @@ class TaskBalancedShardBatches(IterableDataset):
                    "pd_robot_id": entry["pd_robot_id"]}
 
 
+class FullCoverageShardBatches(IterableDataset):
+    """One independently shuffled pass over every converted row, without padding or carry-over."""
+    def __init__(self, converted_dir: Path, manifest_path: Path, batch_size: int, seed: int, expected_rows_per_shard: int | None = 8000):
+        self.converted_dir = Path(converted_dir)
+        self.entries = json.loads(Path(manifest_path).read_text())
+        self.batch_size, self.seed, self.expected_rows_per_shard = batch_size, seed, expected_rows_per_shard
+        if not self.entries or batch_size <= 0:
+            raise ValueError("HD2 full-coverage batches require a nonempty manifest and positive batch size")
+
+    @staticmethod
+    def _collate(parts: list[dict]) -> dict:
+        return {key: torch.cat([part[key] for part in parts], dim=0) for key in ("obs", "target", "context", "obs_mask", "act_mask", "adjacency")}
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed)
+        parts: list[dict] = []
+        pending = 0
+        for entry_index in rng.permutation(len(self.entries)):
+            entry = self.entries[int(entry_index)]
+            with (self.converted_dir / f"{entry['pd_robot_id']}.pkl").open("rb") as stream:
+                payload = pickle.load(stream)
+            rows = len(payload["obs"])
+            if self.expected_rows_per_shard is not None and rows != self.expected_rows_per_shard:
+                raise ValueError(f"HD2 full trainer requires {self.expected_rows_per_shard} rows per shard: {entry['pd_robot_id']}")
+            order = torch.from_numpy(rng.permutation(rows).astype(np.int64, copy=False))
+            offset = 0
+            while offset < rows:
+                take = min(self.batch_size - pending, rows - offset)
+                indices = order[offset:offset + take]
+                parts.append({"obs": payload["obs"][indices], "target": payload["act_mean"][indices],
+                              "context": payload["context"].reshape(1, -1).expand(take, -1),
+                              "obs_mask": payload["obs_padding_mask"].reshape(1, -1).expand(take, -1),
+                              "act_mask": payload["act_padding_mask"].reshape(1, -1).expand(take, -1),
+                              "adjacency": payload["adjacency_matrix"].reshape(1, *payload["adjacency_matrix"].shape).expand(take, -1, -1)})
+                offset += take; pending += take
+                if pending == self.batch_size:
+                    yield self._collate(parts)
+                    parts = []; pending = 0
+        if pending:
+            yield self._collate(parts)
+
+
 def configure_hd2(cfg_path: str, seed: int) -> None:
     cfg.merge_from_file(cfg_path)
     cfg.merge_from_list(["RNG_SEED", seed, "MODEL.TYPE", "hnmlp", "MODEL.MLP.LAYER_NUM", 2,
@@ -159,10 +222,10 @@ def configure_hd2(cfg_path: str, seed: int) -> None:
 
 
 def _make_model(batch: dict) -> ActorCritic:
-    max_limbs = int(batch["obs_mask"].numel())
+    max_limbs = int(batch["obs_mask"].shape[-1])
     cfg.MODEL.MAX_LIMBS = max_limbs
     obs_space = spaces.Dict({"proprioceptive": spaces.Box(-np.inf, np.inf, shape=(batch["obs"].shape[1],), dtype=np.float32),
-                              "context": spaces.Box(-np.inf, np.inf, shape=(batch["context"].numel(),), dtype=np.float32),
+                              "context": spaces.Box(-np.inf, np.inf, shape=(batch["context"].shape[-1],), dtype=np.float32),
                               "obs_padding_mask": spaces.Box(0, 1, shape=(max_limbs,), dtype=np.bool_),
                               "act_padding_mask": spaces.Box(0, 1, shape=(max_limbs * 2,), dtype=np.bool_),
                               "adjacency_matrix": spaces.Box(-np.inf, np.inf, shape=(max_limbs, max_limbs), dtype=np.float32)})
@@ -171,13 +234,97 @@ def _make_model(batch: dict) -> ActorCritic:
 
 def _loss(model, batch, device):
     obs, target = batch["obs"].to(device), batch["target"].to(device)
-    context, obs_mask, act_mask, adjacency = (batch[key].to(device).reshape(1, *batch[key].shape) for key in ("context", "obs_mask", "act_mask", "adjacency"))
     size = len(obs)
+    def per_row(key, dimensions):
+        value = batch[key].to(device)
+        if value.ndim == dimensions:
+            return value.reshape(1, *value.shape).expand(size, *([-1] * dimensions))
+        if value.ndim == dimensions + 1 and len(value) == size:
+            return value
+        raise ValueError(f"HD2 invalid {key} batch shape: {tuple(value.shape)}")
+    context, obs_mask, act_mask, adjacency = (per_row(key, dimensions) for key, dimensions in (("context", 1), ("obs_mask", 1), ("act_mask", 1), ("adjacency", 2)))
     model({"proprioceptive": obs, "context": context.expand(size, -1), "obs_padding_mask": obs_mask.expand(size, -1),
            "act_padding_mask": act_mask.expand(size, -1), "adjacency_matrix": adjacency.expand(size, -1, -1)}, compute_val=False)
     prediction, valid = model.action_mu, (~act_mask).to(dtype=obs.dtype)
     _hd0_check_finite("HD2 prediction", prediction)
     return (((prediction - target).square() * valid).sum(dim=1) / valid.sum(dim=1)).mean()
+
+
+def train_full_hd2b(converted_dir: Path, manifest_path: Path, output: Path, hd1_columns: Path, *, epochs: int = 150,
+                    resume_checkpoint: Path | None = None) -> dict:
+    """Full HD2B training; every epoch visits each of the 8M rows exactly once."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("HD2B full training requires CUDA")
+    if epochs != 150:
+        raise ValueError("HD2B freezes training at exactly 150 epochs")
+    entries = json.loads(Path(manifest_path).read_text())
+    if len(entries) != 1000 or len({entry["pd_robot_id"] for entry in entries}) != 1000:
+        raise ValueError("HD2B full training requires exactly 1000 unique PD shards")
+    if json.loads(Path(hd1_columns).read_text()) != json.loads((Path(converted_dir) / "student_columns.json").read_text()):
+        raise ValueError("HD2B mapper is not semantic-identical to frozen HD1")
+    output = Path(output)
+    if output.exists():
+        if resume_checkpoint is None:
+            raise FileExistsError(f"HD2B training output already exists: {output}")
+    else:
+        output.mkdir(parents=True, exist_ok=False)
+    resume_state = None
+    if resume_checkpoint is not None:
+        resume_checkpoint = Path(resume_checkpoint)
+        if not resume_checkpoint.is_file() or not resume_checkpoint.resolve().is_relative_to(output.resolve()):
+            raise ValueError("HD2B resume checkpoint must be an existing checkpoint below the requested training output")
+        resume_state = torch.load(resume_checkpoint, map_location="cpu")
+        if resume_state.get("seed") != 1409 or not isinstance(resume_state.get("completed_epoch"), int):
+            raise ValueError("HD2B resume checkpoint does not match the frozen training protocol")
+    configure_hd2(str(ROOT / "configs" / "ft.yaml"), 1409)
+    plan = official_epoch_batch_plan(8_000_000, 5120)
+    if plan != {"samples": 8_000_000, "batch_size": 5120, "drop_last": False, "full_batches": 1562,
+                "final_batch_size": 2560, "optimizer_steps": 1563}:
+        raise AssertionError("HD2B frozen batch plan is inconsistent")
+    first = next(iter(FullCoverageShardBatches(converted_dir, manifest_path, 5120, 1409)))
+    torch.manual_seed(1409); np.random.seed(1409)
+    model = _make_model(first)
+    optimizer = optim.Adam(model.parameters(), lr=3e-4, eps=cfg.DISTILL.EPS, weight_decay=cfg.DISTILL.WEIGHT_DECAY)
+    completed_epoch = 0; cumulative_steps = 0; cumulative_samples = 0
+    if resume_state is not None:
+        model.mu_net.load_state_dict(resume_state["mu_net"]); optimizer.load_state_dict(resume_state["optimizer"])
+        completed_epoch = resume_state["completed_epoch"]
+        cumulative_steps = int(resume_state["cumulative_optimizer_steps"])
+        cumulative_samples = int(resume_state["cumulative_samples_seen"])
+    if completed_epoch < 0 or completed_epoch >= epochs:
+        raise ValueError("HD2B resume checkpoint completed_epoch is outside [0, 149]")
+    checkpoints = output / "checkpoints"; checkpoints.mkdir(exist_ok=True)
+    metrics_path = output / "epoch_metrics.jsonl"
+    model.train(); epoch_rows = []
+    for epoch in range(completed_epoch + 1, epochs + 1):
+        optimizer_steps = samples_seen = last_batch_size = 0
+        for batch in FullCoverageShardBatches(converted_dir, manifest_path, 5120, 1409 + epoch):
+            optimizer.zero_grad(); loss = _loss(model, batch, torch.device("cuda")); (0.5 * loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5); optimizer.step()
+            optimizer_steps += 1; last_batch_size = len(batch["obs"]); samples_seen += last_batch_size
+        if optimizer_steps != 1563 or samples_seen != 8_000_000 or last_batch_size != 2560:
+            raise AssertionError("HD2B epoch violated the frozen drop_last=False coverage contract")
+        cumulative_steps += optimizer_steps; cumulative_samples += samples_seen
+        row = {"epoch": epoch, "optimizer_steps": optimizer_steps, "samples_seen_this_epoch": samples_seen,
+               "cumulative_optimizer_steps": cumulative_steps, "cumulative_samples_seen": cumulative_samples,
+               "last_batch_size": last_batch_size}
+        with metrics_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, allow_nan=False) + "\n")
+        epoch_rows.append(row)
+        if epoch % 30 == 0:
+            checkpoint = checkpoints / f"checkpoint_{epoch:03d}.pt"
+            torch.save({"mu_net": model.mu_net.state_dict(), "optimizer": optimizer.state_dict(), "seed": 1409,
+                        "completed_epoch": epoch, "cumulative_optimizer_steps": cumulative_steps,
+                        "cumulative_samples_seen": cumulative_samples}, checkpoint)
+    report = {"HD2_DROP_LAST": False, "HD2_FULL_BATCH_SIZE": 5120, "HD2_FULL_BATCH_COUNT_PER_EPOCH": 1562,
+              "HD2_FINAL_BATCH_SIZE": 2560, "HD2_STEPS_PER_EPOCH": 1563, "HD2_SAMPLES_PER_EPOCH": 8_000_000,
+              "HD2B_RESUMABLE_TRAINING": "PASS", "checkpoint_epochs": [30, 60, 90, 120, 150],
+              "final_epoch": epoch_rows[-1], "epoch_metrics": str(metrics_path.resolve())}
+    (output / "hd2b_training_summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    (output / "hd2b_batch_contract.txt").write_text("\n".join(f"{key}={value}" for key, value in (
+        ("HD2_DROP_LAST", "False"), ("HD2_FULL_BATCH_SIZE", 5120), ("HD2_FULL_BATCH_COUNT_PER_EPOCH", 1562),
+        ("HD2_FINAL_BATCH_SIZE", 2560), ("HD2_STEPS_PER_EPOCH", 1563), ("HD2_SAMPLES_PER_EPOCH", 8000000))) + "\n")
+    return report
 
 
 def preflight_update(converted_dir: Path, manifest_path: Path, output: Path, hd1_columns: Path, microbatch: int = 512) -> dict:
@@ -242,11 +389,21 @@ def main():
     convert = sub.add_parser("convert")
     convert.add_argument("--expert", required=True, type=Path); convert.add_argument("--output", required=True, type=Path)
     convert.add_argument("--manifest", required=True, type=Path); convert.add_argument("--hd1-columns", required=True, type=Path)
+    convert.add_argument("--resume", action="store_true", help="reuse only provenance-verified converted shards")
     train = sub.add_parser("preflight-update")
     train.add_argument("--dataset", required=True, type=Path); train.add_argument("--manifest", required=True, type=Path)
     train.add_argument("--output", required=True, type=Path); train.add_argument("--hd1-columns", required=True, type=Path); train.add_argument("--microbatch", type=int, default=512)
+    full = sub.add_parser("train-full-hd2b")
+    full.add_argument("--dataset", required=True, type=Path); full.add_argument("--manifest", required=True, type=Path)
+    full.add_argument("--output", required=True, type=Path); full.add_argument("--hd1-columns", required=True, type=Path)
+    full.add_argument("--resume-checkpoint", type=Path)
     args = parser.parse_args()
-    result = convert_shards(args.expert, args.output, args.manifest, args.hd1_columns) if args.command == "convert" else preflight_update(args.dataset, args.manifest, args.output, args.hd1_columns, args.microbatch)
+    if args.command == "convert":
+        result = convert_shards(args.expert, args.output, args.manifest, args.hd1_columns, resume=args.resume, label="HD2B" if args.resume else "HD2A")
+    elif args.command == "preflight-update":
+        result = preflight_update(args.dataset, args.manifest, args.output, args.hd1_columns, args.microbatch)
+    else:
+        result = train_full_hd2b(args.dataset, args.manifest, args.output, args.hd1_columns, resume_checkpoint=args.resume_checkpoint)
     print(json.dumps(result, sort_keys=True))
 
 
