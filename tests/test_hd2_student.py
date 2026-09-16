@@ -1,4 +1,5 @@
 import json
+import hashlib
 import pickle
 import sys
 import tempfile
@@ -9,10 +10,29 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.hd2_student import TaskBalancedShardBatches  # noqa: E402
+from tools.hd2_student import (  # noqa: E402
+    FROZEN_HD1_COLUMNS_SHA256,
+    TaskBalancedShardBatches,
+    load_frozen_hd1_columns,
+    select_frozen_student_observation,
+    write_frozen_student_columns,
+)
 
 
 class Hd2ShardTests(unittest.TestCase):
+    def test_converter_uses_authoritative_hd1_columns_not_first_17_per_limb(self):
+        columns_path = ROOT / "tools" / "hd1_student_columns.json"
+        columns, raw = load_frozen_hd1_columns(columns_path)
+        self.assertEqual(len(columns), 204)
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), FROZEN_HD1_COLUMNS_SHA256)
+        teacher_obs = torch.arange(624, dtype=torch.float32).reshape(1, 624).numpy()
+        converted = select_frozen_student_observation(teacher_obs, columns)
+        self.assertTrue((converted[0] == teacher_obs[0, columns]).all())
+        self.assertNotEqual(columns, [base + offset for base in range(0, 624, 52) for offset in range(17)])
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            write_frozen_student_columns(Path(temporary), raw)
+            self.assertEqual((Path(temporary) / "student_columns.json").read_bytes(), raw)
+
     def test_lazy_task_batches_open_one_named_shard_per_yield(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
             root = Path(temporary); entries = []

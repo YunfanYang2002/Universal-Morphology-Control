@@ -150,6 +150,27 @@ def collect_one(runtime, entry, destination):
             "shard_sha256": sha256(destination)}
 
 
+def teacher_coverage_summary(metrics):
+    """Cost/coverage audit only; no morphology filtering or collection-policy change."""
+    per_robot = []
+    for row in metrics:
+        lengths = np.asarray(row["episode_length_distribution"], dtype=np.float64)
+        returns = np.asarray(row["teacher_return_distribution"], dtype=np.float64)
+        episodes = int(row["episode_count_required_to_reach_8000"])
+        per_robot.append({"pd_robot_id": row["pd_robot_id"], "episode_count_to_8000": episodes,
+                          "early_termination_count": int(row["early_termination_count"]),
+                          "early_termination_fraction": float(row["early_termination_count"] / episodes),
+                          "median_episode_length": float(np.median(lengths)),
+                          "teacher_return_mean": float(np.mean(returns)), "teacher_return_median": float(np.median(returns))})
+    def quantiles(values):
+        return {f"p{percent}": float(np.percentile(values, percent)) for percent in (50, 90, 95, 99)} | {"max": float(np.max(values))}
+    return {"collection_policy": "audit_only_no_filtering", "per_pd_robot": per_robot,
+            "episode_count_to_8000": quantiles([row["episode_count_to_8000"] for row in per_robot]),
+            "early_termination_fraction": quantiles([row["early_termination_fraction"] for row in per_robot]),
+            "median_episode_length": quantiles([row["median_episode_length"] for row in per_robot]),
+            "teacher_return_mean": quantiles([row["teacher_return_mean"] for row in per_robot])}
+
+
 def main():
     args = parse_args(); runtime = _configure(args); entries = json.loads(args.manifest.read_text(encoding="utf-8"))
     if len(entries) != 10 or len({entry["pd_robot_id"] for entry in entries}) != 10:
@@ -161,6 +182,7 @@ def main():
         metrics = [collect_one(runtime, entry, args.output / f"{entry['pd_robot_id']}.npz") for entry in entries]
         result = {"HD2A_EXACT_8000": "PASS", "HD2A_TOTAL_TRANSITIONS": sum(row["transition_count"] for row in metrics), "per_robot": metrics}
         (args.output / "collection_metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+        (args.output / "teacher_coverage_summary.json").write_text(json.dumps(teacher_coverage_summary(metrics), indent=2) + "\n")
     print(json.dumps(result, sort_keys=True))
 
 

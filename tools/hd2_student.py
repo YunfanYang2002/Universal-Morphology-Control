@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 from metamorph.algos.distill.distill import _hd0_check_finite, _hd0_tensor  # noqa: E402
 from metamorph.algos.ppo.model import ActorCritic  # noqa: E402
 from metamorph.config import cfg  # noqa: E402
-from tools.convert_rmamorph_teacher_to_hyperdistill import STUDENT_LABELS, nominal_context  # noqa: E402
+from tools.convert_rmamorph_teacher_to_hyperdistill import nominal_context  # noqa: E402
 
 try:
     import resource
@@ -39,33 +39,49 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def columns_from_labels(labels: list[str], max_limbs: int) -> list[int]:
-    if len(set(labels)) != len(labels):
-        raise ValueError("ambiguous teacher feature labels")
-    return [limb * len(labels) + labels.index(label) for limb in range(max_limbs) for label in STUDENT_LABELS]
+FROZEN_HD1_COLUMN_COUNT = 204
+FROZEN_HD1_COLUMNS_SHA256 = "5aae11e48a05f57bca706085939d3ed47985f8c80e2e37299766e8d5f309917d"
+TEACHER_PROPRIO_DIM = 624
+
+
+def load_frozen_hd1_columns(path: Path) -> tuple[list[int], bytes]:
+    raw = Path(path).read_bytes()
+    columns = json.loads(raw)
+    if (not isinstance(columns, list) or len(columns) != FROZEN_HD1_COLUMN_COUNT
+            or any(type(column) is not int for column in columns)
+            or len(set(columns)) != FROZEN_HD1_COLUMN_COUNT
+            or min(columns) < 0 or max(columns) >= TEACHER_PROPRIO_DIM):
+        raise ValueError("frozen HD1 student columns must be 204 unique indices in [0, 624)")
+    semantic_hash = hashlib.sha256(json.dumps(columns).encode()).hexdigest()
+    if semantic_hash != FROZEN_HD1_COLUMNS_SHA256:
+        raise ValueError(f"frozen HD1 student columns hash mismatch: {semantic_hash}")
+    return columns, raw
+
+
+def select_frozen_student_observation(teacher_observation: np.ndarray, frozen_columns: list[int]) -> np.ndarray:
+    if teacher_observation.ndim != 2 or teacher_observation.shape[1] != TEACHER_PROPRIO_DIM:
+        raise ValueError(f"HD2 expert observation must have shape [N, 624], got {teacher_observation.shape}")
+    return teacher_observation[:, frozen_columns]
+
+
+def write_frozen_student_columns(output: Path, frozen_bytes: bytes) -> None:
+    (Path(output) / "student_columns.json").write_bytes(frozen_bytes)
 
 
 def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, hd1_columns: Path) -> dict:
     """Convert one 8k NPZ per PD robot; each pickle is self-contained and reload-checked."""
     expert_dir, converted_dir = Path(expert_dir), Path(converted_dir)
     entries = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    expected_columns = Path(hd1_columns).read_bytes()
-    expected = json.loads(expected_columns)
-    expected_semantic_sha256 = hashlib.sha256(json.dumps(expected, separators=(",", ":")).encode()).hexdigest()
+    frozen_columns, frozen_bytes = load_frozen_hd1_columns(hd1_columns)
     converted_dir.mkdir(parents=True, exist_ok=False)
-    # HD1 historically used json.dumps without a final newline.  Compare semantic
-    # content, then emit precisely that canonical frozen representation for HD2.
-    (converted_dir / "student_columns.json").write_text(json.dumps(expected), encoding="utf-8")
+    write_frozen_student_columns(converted_dir, frozen_bytes)
     bytes_on_disk = 0
     for entry in entries:
         source = expert_dir / f"{entry['pd_robot_id']}.npz"
         with np.load(source, allow_pickle=False) as data:
-            labels = json.loads(str(data["per_limb_obs_labels"].item()))
             max_limbs = int(data["max_limbs"].item())
-            columns = columns_from_labels(labels, max_limbs)
-            if columns != expected:
-                raise ValueError("HD2 mapper differs from frozen HD1 student_columns.json")
-            obs, target = data["proprio_normalized"][:, columns], data["action_mean"]
+            teacher_obs = data["proprio_normalized"]
+            obs, target = select_frozen_student_observation(teacher_obs, frozen_columns), data["action_mean"]
             context_raw, obs_mask, act_mask, adjacency = data["context_raw"], data["obs_padding_mask"], data["act_padding_mask"], data["adjacency"]
             if len(obs) != 8000 or context_raw.ndim != 3 or not np.array_equal(context_raw, np.broadcast_to(context_raw[0], context_raw.shape)):
                 raise ValueError(f"HD2 {entry['pd_robot_id']} is not an exact-static 8000-transition shard")
@@ -77,7 +93,7 @@ def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, h
             payload = {"obs": torch.from_numpy(np.array(obs, copy=True)), "act_mean": torch.from_numpy(np.array(target, copy=True)),
                        "context": torch.from_numpy(context), "obs_padding_mask": torch.from_numpy(obs_mask[0].astype(bool)),
                        "act_padding_mask": torch.from_numpy(act_mask[0].astype(bool)), "adjacency_matrix": torch.from_numpy(adjacency[0]),
-                       "teacher_obs_rms": {"mean": torch.from_numpy(data["rms_mean"][columns].copy()), "var": torch.from_numpy(data["rms_var"][columns].copy()), "count": torch.from_numpy(data["rms_count"].copy())},
+                       "teacher_obs_rms": {"mean": torch.from_numpy(data["rms_mean"][frozen_columns].copy()), "var": torch.from_numpy(data["rms_var"][frozen_columns].copy()), "count": torch.from_numpy(data["rms_count"].copy())},
                        "manifest": {"context_version": 1, "proprio_features_per_limb": 17, "max_limbs": max_limbs,
                                     "normalization": "teacher_obs_rms_then_selected", "pd_robot_id": entry["pd_robot_id"],
                                     "parent_walker_id": entry["parent_walker_id"], "parent_family": entry["parent_family"], "source_sha256": sha256(source)}}
@@ -90,7 +106,10 @@ def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, h
             raise RuntimeError(f"HD2 shard reload mismatch: {entry['pd_robot_id']}")
         bytes_on_disk += destination.stat().st_size
     report = {"HD2A_SHARDED_DATASET": "PASS", "HD2A_MAPPER_IDENTITY": "PASS", "dataset_bytes_on_disk": bytes_on_disk,
-              "shard_count": len(entries), "student_columns_semantic_sha256": expected_semantic_sha256}
+              "shard_count": len(entries), "student_columns_sha256": FROZEN_HD1_COLUMNS_SHA256,
+              "FROZEN_HD1_COLUMNS_LENGTH": FROZEN_HD1_COLUMN_COUNT, "FROZEN_HD1_COLUMNS_HASH": "PASS",
+              "HD2_CONVERTER_USES_FROZEN_COLUMNS": "PASS", "HD2_CONVERTER_DOES_NOT_DERIVE_FIRST_17_PER_LIMB": "PASS",
+              "HD2_OUTPUT_COLUMNS_EQUALS_HD1": "PASS"}
     (converted_dir / "conversion_audit.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 

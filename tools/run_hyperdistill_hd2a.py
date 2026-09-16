@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import traceback
@@ -37,6 +38,57 @@ def serialize_status(status: dict) -> dict:
     return {key: ("NOT_MEASURED" if key == "HD2A_FINAL" else "NOT_RUN") if value is None else value for key, value in status.items()}
 
 
+def verify_resume_run(run_root: Path, config: Path, checkpoint: Path) -> tuple[Path, dict]:
+    """Accept only a complete, hash-bound HD2A collection and return its inventory."""
+    run_root = Path(run_root).resolve()
+    if not run_root.is_dir() or not run_root.is_relative_to((ROOT / "tmp").resolve()):
+        raise ValueError("RESUME_REJECTED: --resume-run must be an existing run below project ./tmp")
+    protocol_path, teacher_config_path, manifest_path = (run_root / name for name in ("frozen_protocol.json", "teacher_config.yaml", "manifest.json"))
+    if not all(path.is_file() for path in (protocol_path, teacher_config_path, manifest_path)):
+        raise ValueError("RESUME_REJECTED: missing frozen run provenance")
+    if json.loads(protocol_path.read_text()) != PROTOCOL or sha256(teacher_config_path) != sha256(config):
+        raise ValueError("RESUME_REJECTED: frozen protocol or teacher config differs")
+    old_manifest = json.loads(manifest_path.read_text())
+    teacher = old_manifest.get("teacher", {})
+    if teacher.get("checkpoint_sha256") != sha256(checkpoint) or teacher.get("config_sha256") != sha256(config):
+        raise ValueError("RESUME_REJECTED: teacher checkpoint/config hash differs")
+    inventory_dir = run_root / "pd_inventory"
+    selection_path = inventory_dir / "provenance" / "mutation_manifest.json"
+    parents_path = inventory_dir / "provenance" / "parents.json"
+    validity_path = run_root / "pd_validity" / "pd_validity.json"
+    collection_path = run_root / "expert_shards" / "collection_metrics.json"
+    if not all(path.is_file() for path in (selection_path, parents_path, validity_path, collection_path)):
+        raise ValueError("RESUME_REJECTED: PD inventory, validity, or collection provenance is missing")
+    selected, parents = json.loads(selection_path.read_text()), json.loads(parents_path.read_text())
+    if len(parents) != 100 or len(selected) != 10 or len({row.get("pd_robot_id") for row in selected}) != 10:
+        raise ValueError("RESUME_REJECTED: PD inventory counts differ from frozen HD2A")
+    for row in selected:
+        for path_key, hash_key in (("materialized_xml_path", "pd_xml_sha256"), ("materialized_metadata_path", "pd_metadata_sha256")):
+            path = Path(row.get(path_key, ""))
+            if not path.is_file() or sha256(path) != row.get(hash_key):
+                raise ValueError(f"RESUME_REJECTED: PD inventory hash mismatch for {row.get('pd_robot_id')}")
+    validity = json.loads(validity_path.read_text())
+    if validity.get("HD2_PD_VALIDITY") != "PASS" or {row.get("pd_robot_id") for row in validity.get("per_robot", [])} != {row["pd_robot_id"] for row in selected}:
+        raise ValueError("RESUME_REJECTED: PD validity is not a complete PASS")
+    collection = json.loads(collection_path.read_text())
+    rows = collection.get("per_robot", [])
+    if collection.get("HD2A_EXACT_8000") != "PASS" or collection.get("HD2A_TOTAL_TRANSITIONS") != 80000 or len(rows) != 10:
+        raise ValueError("RESUME_REJECTED: collection totals are not exact HD2A 80k")
+    for row in rows:
+        shard = run_root / "expert_shards" / f"{row.get('pd_robot_id')}.npz"
+        if row.get("transition_count") != 8000 or not shard.is_file() or sha256(shard) != row.get("shard_sha256"):
+            raise ValueError(f"RESUME_REJECTED: expert shard is absent or hash-mismatched for {row.get('pd_robot_id')}")
+    return inventory_dir, collection
+
+
+def clear_incomplete_downstream_stage(run_root: Path, name: str, completion_file: str) -> None:
+    stage = run_root / name
+    if stage.exists():
+        if (stage / completion_file).is_file():
+            raise ValueError(f"RESUME_REJECTED: {name} already completed; no implicit overwrite")
+        shutil.rmtree(stage)
+
+
 def package(output: Path) -> Path:
     manifest_path = output / "manifest.json"; manifest = json.loads(manifest_path.read_text())
     files = [path for path in output.rglob("*") if path.is_file() and path != manifest_path and "temp" not in path.relative_to(output).parts]
@@ -59,9 +111,17 @@ def main():
     parser.add_argument("--pd-source", type=Path, default=ROOT / "data/train_mutate_1000")
     parser.add_argument("--ood-pool", type=Path, default=Path("configs/morphadapt_metamorph_dr_formal_ood98.txt"))
     parser.add_argument("--microbatch", type=int, default=512)
+    parser.add_argument("--resume-run", type=Path, help="verified existing HD2A run under ./tmp; resumes at conversion")
     args = parser.parse_args(); os.chdir(ROOT)
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-    output = ROOT / "tmp" / f"hyperdistill_hd2a_preflight_{stamp}"; (output / "temp").mkdir(parents=True)
+    fresh_run = args.resume_run is None
+    if fresh_run:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        output = ROOT / "tmp" / f"hyperdistill_hd2a_preflight_{stamp}"; output.mkdir(parents=True, exist_ok=False)
+    else:
+        output = args.resume_run.resolve()
+        if not output.is_dir() or not output.is_relative_to((ROOT / "tmp").resolve()):
+            raise ValueError("--resume-run must be an existing directory below project ./tmp")
+    (output / "temp").mkdir(parents=True, exist_ok=True)
     for key in ("TMP", "TEMP", "TMPDIR"): os.environ[key] = str(output / "temp")
     status = {key: None for key in STATUS_KEYS}; unmeasured = set(STATUS_KEYS)
     manifest = {"protocol": PROTOCOL, "stages": [], "unmeasured": [], "commands": [], "python": sys.executable,
@@ -88,7 +148,8 @@ def main():
         if sha256(checkpoint) != TEACHER_SHA or sha256(config) != CONFIG_SHA:
             raise ValueError("HD2 teacher/config differs from frozen HD0/HD1 pair")
         if not args.hd1_student_columns.is_file(): raise FileNotFoundError("actual frozen HD1 student_columns.json is required")
-        (output / "teacher_config.yaml").write_bytes(config.read_bytes()); (output / "frozen_protocol.json").write_text(json.dumps(PROTOCOL, indent=2))
+        if fresh_run:
+            (output / "teacher_config.yaml").write_bytes(config.read_bytes()); (output / "frozen_protocol.json").write_text(json.dumps(PROTOCOL, indent=2))
         manifest["teacher"] = {"checkpoint": str(checkpoint), "checkpoint_sha256": sha256(checkpoint), "config": str(config), "config_sha256": sha256(config)}
         manifest["git"] = {label: {"sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
                                    "tracked_changes": subprocess.check_output(["git", "status", "--short", "--untracked-files=no"], cwd=repo, text=True)} for label, repo in (("hyperdistill", ROOT), ("rmamorph", teacher_root))}
@@ -96,14 +157,22 @@ def main():
         for name in ("torch", "numpy", "gym", "mujoco-py", "PyYAML"):
             try: manifest["environment_versions"][name] = importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError: manifest["environment_versions"][name] = "NOT_AVAILABLE"
-        inventory_dir, inventory = prepare_inventory_stage(config, ood_pool, args.pd_source, output)
-        update({"HD2A_PD_GENERATION": "PASS"}); selection = inventory_dir / "provenance" / "mutation_manifest.json"; walker_dir = inventory_dir / "pd1000"
-        common = ["--rmamorph-root", teacher_root, "--config", config, "--checkpoint", checkpoint, "--manifest", selection, "--walker-dir", walker_dir]
-        stage("pd_validity", "hd2_teacher_export.py", ["validate", *common, "--output", output / "pd_validity"], teacher_root)
-        validity = json.loads((output / "pd_validity" / "pd_validity.json").read_text()); update({"HD2A_PD_VALIDITY": "PASS" if validity["HD2_PD_VALIDITY"] == "PASS" else "FAIL"})
-        stage("expert_collection", "hd2_teacher_export.py", ["collect", *common, "--output", output / "expert_shards"], teacher_root)
-        collection = json.loads((output / "expert_shards" / "collection_metrics.json").read_text()); update({"HD2A_EXACT_8000": collection["HD2A_EXACT_8000"], "HD2A_TOTAL_TRANSITIONS": collection["HD2A_TOTAL_TRANSITIONS"]})
-        if collection["HD2A_TOTAL_TRANSITIONS"] != 80000: raise AssertionError("HD2A requires exactly 80000 transitions")
+        if fresh_run:
+            inventory_dir, inventory = prepare_inventory_stage(config, ood_pool, args.pd_source, output)
+            update({"HD2A_PD_GENERATION": "PASS"}); selection = inventory_dir / "provenance" / "mutation_manifest.json"; walker_dir = inventory_dir / "pd1000"
+            common = ["--rmamorph-root", teacher_root, "--config", config, "--checkpoint", checkpoint, "--manifest", selection, "--walker-dir", walker_dir]
+            stage("pd_validity", "hd2_teacher_export.py", ["validate", *common, "--output", output / "pd_validity"], teacher_root)
+            validity = json.loads((output / "pd_validity" / "pd_validity.json").read_text()); update({"HD2A_PD_VALIDITY": "PASS" if validity["HD2_PD_VALIDITY"] == "PASS" else "FAIL"})
+            stage("expert_collection", "hd2_teacher_export.py", ["collect", *common, "--output", output / "expert_shards"], teacher_root)
+            collection = json.loads((output / "expert_shards" / "collection_metrics.json").read_text()); update({"HD2A_EXACT_8000": collection["HD2A_EXACT_8000"], "HD2A_TOTAL_TRANSITIONS": collection["HD2A_TOTAL_TRANSITIONS"]})
+            if collection["HD2A_TOTAL_TRANSITIONS"] != 80000: raise AssertionError("HD2A requires exactly 80000 transitions")
+        else:
+            inventory_dir, collection = verify_resume_run(output, config, checkpoint)
+            selection = inventory_dir / "provenance" / "mutation_manifest.json"
+            update({"HD2A_PD_GENERATION": "PASS", "HD2A_PD_VALIDITY": "PASS", "HD2A_EXACT_8000": "PASS", "HD2A_TOTAL_TRANSITIONS": 80000})
+            manifest["resume"] = {"run_root": str(output), "collection_metrics_sha256": sha256(output / "expert_shards" / "collection_metrics.json"), "verified": "PASS"}
+            clear_incomplete_downstream_stage(output, "converted_shards", "conversion_audit.json")
+            clear_incomplete_downstream_stage(output, "student", "hd2a_update_metrics.json")
         stage("convert", "hd2_student.py", ["convert", "--expert", output / "expert_shards", "--output", output / "converted_shards", "--manifest", selection, "--hd1-columns", args.hd1_student_columns], ROOT)
         conversion = json.loads((output / "converted_shards" / "conversion_audit.json").read_text()); update(conversion)
         stage("one_effective_batch", "hd2_student.py", ["preflight-update", "--dataset", output / "converted_shards", "--manifest", selection, "--output", output / "student", "--hd1-columns", args.hd1_student_columns, "--microbatch", args.microbatch], ROOT)
