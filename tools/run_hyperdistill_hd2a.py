@@ -6,6 +6,7 @@ import datetime
 import importlib.metadata
 import json
 import os
+import pickle
 import platform
 import shutil
 import subprocess
@@ -81,12 +82,82 @@ def verify_resume_run(run_root: Path, config: Path, checkpoint: Path) -> tuple[P
     return inventory_dir, collection
 
 
-def clear_incomplete_downstream_stage(run_root: Path, name: str, completion_file: str) -> None:
+def stage_state(run_root: Path, name: str, completion_file: str) -> str:
     stage = run_root / name
-    if stage.exists():
-        if (stage / completion_file).is_file():
-            raise ValueError(f"RESUME_REJECTED: {name} already completed; no implicit overwrite")
-        shutil.rmtree(stage)
+    if not stage.exists():
+        return "RUN"
+    return "COMPLETED" if (stage / completion_file).is_file() else "INCOMPLETE"
+
+
+def resolve_resume_stage(run_root: Path, name: str, completion_file: str, validator) -> tuple[str, dict | str | None]:
+    state = stage_state(run_root, name, completion_file)
+    if state == "INCOMPLETE":
+        shutil.rmtree(run_root / name)
+        return "RUN", "CLEARED_INCOMPLETE"
+    if state == "COMPLETED":
+        return "SKIP", validator()
+    return "RUN", None
+
+
+def validate_converted_stage(run_root: Path, selection_path: Path) -> dict:
+    stage = run_root / "converted_shards"
+    audit = json.loads((stage / "conversion_audit.json").read_text())
+    required = {"HD2A_SHARDED_DATASET": "PASS", "HD2A_MAPPER_IDENTITY": "PASS", "FROZEN_HD1_COLUMNS_LENGTH": 204,
+                "FROZEN_HD1_COLUMNS_HASH": "PASS", "HD2_CONVERTER_USES_FROZEN_COLUMNS": "PASS",
+                "HD2_CONVERTER_DOES_NOT_DERIVE_FIRST_17_PER_LIMB": "PASS", "HD2_OUTPUT_COLUMNS_EQUALS_HD1": "PASS",
+                "student_columns_sha256": "5aae11e48a05f57bca706085939d3ed47985f8c80e2e37299766e8d5f309917d", "shard_count": 10}
+    if any(audit.get(key) != value for key, value in required.items()):
+        raise ValueError("RESUME_REJECTED: converted-shard completion audit differs from frozen contract")
+    columns = stage / "student_columns.json"
+    if not columns.is_file() or sha256(columns) != required["student_columns_sha256"]:
+        raise ValueError("RESUME_REJECTED: converted student_columns.json differs from frozen HD1 mapper")
+    entries = json.loads(selection_path.read_text())
+    expected = {entry["pd_robot_id"] for entry in entries}
+    actual = {path.stem for path in stage.glob("*.pkl")}
+    if actual != expected:
+        raise ValueError("RESUME_REJECTED: converted shard inventory differs from selected PD robots")
+    verified = []
+    for pd_robot_id in sorted(expected):
+        path = stage / f"{pd_robot_id}.pkl"
+        with path.open("rb") as stream:
+            payload = pickle.load(stream)
+        source = run_root / "expert_shards" / f"{pd_robot_id}.npz"
+        if payload.get("manifest", {}).get("pd_robot_id") != pd_robot_id or payload.get("manifest", {}).get("source_sha256") != sha256(source):
+            raise ValueError(f"RESUME_REJECTED: converted provenance mismatch for {pd_robot_id}")
+        verified.append({"pd_robot_id": pd_robot_id, "sha256": sha256(path)})
+    return {"HD2A_SHARDED_DATASET": "PASS", "HD2A_MAPPER_IDENTITY": "PASS", "CONVERT_STAGE": "REUSED_VERIFIED", "verified_shards": verified}
+
+
+def validate_student_stage(run_root: Path) -> dict:
+    stage = run_root / "student"
+    metrics_path, checkpoint = stage / "hd2a_update_metrics.json", stage / "checkpoint_000.pt"
+    metrics = json.loads(metrics_path.read_text())
+    required = {"HD2A_TASK_BALANCE": "PASS", "HD2A_EFFECTIVE_BATCH_5120": "PASS", "HD2A_CONTEXT_DROPOUT": "PASS",
+                "HD2A_CHECKPOINT_RELOAD": "PASS", "HD2_EFFECTIVE_BATCH_SIZE": 5120, "HD2_BATCH_IMPLEMENTATION": "physical",
+                "microbatch": 5120, "optimizer_updates": 1}
+    if any(metrics.get(key) != value for key, value in required.items()) or not checkpoint.is_file():
+        raise ValueError("RESUME_REJECTED: student preflight completion audit differs from frozen contract")
+    import torch
+    state = torch.load(checkpoint, map_location="cpu")
+    if set(state) != {"mu_net", "optimizer", "seed"} or state["seed"] != 1409:
+        raise ValueError("RESUME_REJECTED: student checkpoint is unreadable or incompatible")
+    return {key: metrics[key] for key in ("HD2A_TASK_BALANCE", "HD2A_EFFECTIVE_BATCH_5120", "HD2A_CONTEXT_DROPOUT", "HD2A_CHECKPOINT_RELOAD")} | {"STUDENT_PREFLIGHT_STAGE": "REUSED_VERIFIED", "checkpoint_sha256": sha256(checkpoint)}
+
+
+def archive_stale_failure(run_root: Path) -> None:
+    failure = run_root / "failure.txt"
+    if not failure.is_file():
+        return
+    history_path = run_root / "resume_history.json"
+    history = json.loads(history_path.read_text()) if history_path.is_file() else []
+    attempt = len(history) + 2
+    archive = run_root / "attempt_history" / f"attempt_{attempt:03d}_failure.txt"
+    archive.parent.mkdir(exist_ok=True)
+    reason = failure.read_text()
+    shutil.move(str(failure), archive)
+    history.append({"attempt": attempt, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "failure_reason": reason, "resume_verification": "PASS"})
+    history_path.write_text(json.dumps(history, indent=2) + "\n")
 
 
 def package(output: Path) -> Path:
@@ -171,12 +242,29 @@ def main():
             selection = inventory_dir / "provenance" / "mutation_manifest.json"
             update({"HD2A_PD_GENERATION": "PASS", "HD2A_PD_VALIDITY": "PASS", "HD2A_EXACT_8000": "PASS", "HD2A_TOTAL_TRANSITIONS": 80000})
             manifest["resume"] = {"run_root": str(output), "collection_metrics_sha256": sha256(output / "expert_shards" / "collection_metrics.json"), "verified": "PASS"}
-            clear_incomplete_downstream_stage(output, "converted_shards", "conversion_audit.json")
-            clear_incomplete_downstream_stage(output, "student", "hd2a_update_metrics.json")
-        stage("convert", "hd2_student.py", ["convert", "--expert", output / "expert_shards", "--output", output / "converted_shards", "--manifest", selection, "--hd1-columns", args.hd1_student_columns], ROOT)
-        conversion = json.loads((output / "converted_shards" / "conversion_audit.json").read_text()); update(conversion)
-        stage("one_effective_batch", "hd2_student.py", ["preflight-update", "--dataset", output / "converted_shards", "--manifest", selection, "--output", output / "student", "--hd1-columns", args.hd1_student_columns, "--microbatch", args.microbatch], ROOT)
-        update(json.loads((output / "student" / "hd2a_update_metrics.json").read_text()))
+            archive_stale_failure(output)
+        convert_state = "RUN" if fresh_run else stage_state(output, "converted_shards", "conversion_audit.json")
+        student_state = "RUN" if fresh_run else stage_state(output, "student", "hd2a_update_metrics.json")
+        if not fresh_run and student_state == "COMPLETED" and convert_state != "COMPLETED":
+            raise ValueError("RESUME_REJECTED: completed student preflight lacks a completed converted-shard stage")
+        if not fresh_run:
+            convert_state, conversion = resolve_resume_stage(output, "converted_shards", "conversion_audit.json", lambda: validate_converted_stage(output, selection))
+            if convert_state == "RUN" and conversion: manifest.setdefault("resume_stages", {})["convert"] = conversion
+        if convert_state == "SKIP":
+            update(conversion)
+            manifest.setdefault("resume_stages", {})["convert"] = conversion["CONVERT_STAGE"]
+        else:
+            stage("convert", "hd2_student.py", ["convert", "--expert", output / "expert_shards", "--output", output / "converted_shards", "--manifest", selection, "--hd1-columns", args.hd1_student_columns], ROOT)
+            conversion = json.loads((output / "converted_shards" / "conversion_audit.json").read_text()); update(conversion)
+        if not fresh_run:
+            student_state, student = resolve_resume_stage(output, "student", "hd2a_update_metrics.json", lambda: validate_student_stage(output))
+            if student_state == "RUN" and student: manifest.setdefault("resume_stages", {})["student"] = student
+        if student_state == "SKIP":
+            update(student)
+            manifest.setdefault("resume_stages", {})["student"] = student["STUDENT_PREFLIGHT_STAGE"]
+        else:
+            stage("one_effective_batch", "hd2_student.py", ["preflight-update", "--dataset", output / "converted_shards", "--manifest", selection, "--output", output / "student", "--hd1-columns", args.hd1_student_columns, "--microbatch", args.microbatch], ROOT)
+            update(json.loads((output / "student" / "hd2a_update_metrics.json").read_text()))
         required = ["HD2A_PD_GENERATION", "HD2A_PD_VALIDITY", "HD2A_EXACT_8000", "HD2A_SHARDED_DATASET", "HD2A_MAPPER_IDENTITY", "HD2A_TASK_BALANCE", "HD2A_EFFECTIVE_BATCH_5120", "HD2A_CONTEXT_DROPOUT", "HD2A_CHECKPOINT_RELOAD"]
         status["HD2A_FINAL"] = "PASS" if all(status[key] == "PASS" for key in required) and status["HD2A_TOTAL_TRANSITIONS"] == 80000 else "FAIL"; unmeasured.discard("HD2A_FINAL")
         code = 0 if status["HD2A_FINAL"] == "PASS" else 1

@@ -68,6 +68,15 @@ def write_frozen_student_columns(output: Path, frozen_bytes: bytes) -> None:
     (Path(output) / "student_columns.json").write_bytes(frozen_bytes)
 
 
+def official_epoch_batch_plan(samples: int, batch_size: int) -> dict:
+    if samples <= 0 or batch_size <= 0:
+        raise ValueError("samples and batch_size must be positive")
+    full_batches, final_batch = divmod(samples, batch_size)
+    return {"samples": samples, "batch_size": batch_size, "drop_last": False,
+            "full_batches": full_batches, "final_batch_size": final_batch,
+            "optimizer_steps": full_batches + int(final_batch != 0)}
+
+
 def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, hd1_columns: Path) -> dict:
     """Convert one 8k NPZ per PD robot; each pickle is self-contained and reload-checked."""
     expert_dir, converted_dir = Path(expert_dir), Path(converted_dir)
@@ -105,11 +114,15 @@ def convert_shards(expert_dir: Path, converted_dir: Path, manifest_path: Path, h
         if not torch.equal(payload["obs"], reloaded["obs"]):
             raise RuntimeError(f"HD2 shard reload mismatch: {entry['pd_robot_id']}")
         bytes_on_disk += destination.stat().st_size
+    shard_artifacts = []
+    for entry in entries:
+        path = converted_dir / f"{entry['pd_robot_id']}.pkl"
+        shard_artifacts.append({"pd_robot_id": entry["pd_robot_id"], "bytes": path.stat().st_size, "sha256": sha256(path)})
     report = {"HD2A_SHARDED_DATASET": "PASS", "HD2A_MAPPER_IDENTITY": "PASS", "dataset_bytes_on_disk": bytes_on_disk,
               "shard_count": len(entries), "student_columns_sha256": FROZEN_HD1_COLUMNS_SHA256,
               "FROZEN_HD1_COLUMNS_LENGTH": FROZEN_HD1_COLUMN_COUNT, "FROZEN_HD1_COLUMNS_HASH": "PASS",
               "HD2_CONVERTER_USES_FROZEN_COLUMNS": "PASS", "HD2_CONVERTER_DOES_NOT_DERIVE_FIRST_17_PER_LIMB": "PASS",
-              "HD2_OUTPUT_COLUMNS_EQUALS_HD1": "PASS"}
+              "HD2_OUTPUT_COLUMNS_EQUALS_HD1": "PASS", "shard_artifacts": shard_artifacts}
     (converted_dir / "conversion_audit.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
@@ -207,10 +220,13 @@ def preflight_update(converted_dir: Path, manifest_path: Path, output: Path, hd1
     reloaded = torch.load(checkpoint, map_location="cpu")
     if set(reloaded) != {"mu_net", "optimizer", "seed"} or reloaded["seed"] != 1409:
         raise RuntimeError("HD2A checkpoint reload failed")
+    epoch_plan = official_epoch_batch_plan(8000000, 5120)
     metrics = {"HD2A_TASK_BALANCE": "PASS", "HD2A_EFFECTIVE_BATCH_5120": "PASS", "HD2A_CONTEXT_DROPOUT": "PASS",
                "HD2A_CHECKPOINT_RELOAD": "PASS", "HD2_EFFECTIVE_BATCH_SIZE": 5120,
                "HD2_BATCH_IMPLEMENTATION": batch_implementation, "microbatch": 5120 if batch_implementation == "physical" else microbatch,
-               "optimizer_updates": 1, "optimizer_steps_per_epoch_at_8m": 8000000 // 5120,
+               "optimizer_updates": 1, "HD2_FULL_BATCH_SIZE": epoch_plan["batch_size"], "HD2_DROP_LAST": epoch_plan["drop_last"],
+               "HD2_STEPS_PER_EPOCH_AT_8M": epoch_plan["optimizer_steps"], "HD2_FINAL_BATCH_SIZE_AT_8M": epoch_plan["final_batch_size"],
+               "HD2_SAMPLES_PER_EPOCH": epoch_plan["samples"],
                "mean_masked_action_mse": float(np.mean(losses)), "samples_per_second": 5120 / (time.monotonic() - started),
                "peak_gpu_vram_bytes": int(torch.cuda.max_memory_allocated()),
                "peak_host_ram_bytes": ("NOT_AVAILABLE" if resource is None else int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024),

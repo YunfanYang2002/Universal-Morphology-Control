@@ -14,12 +14,20 @@ from tools.hd2_student import (  # noqa: E402
     FROZEN_HD1_COLUMNS_SHA256,
     TaskBalancedShardBatches,
     load_frozen_hd1_columns,
+    official_epoch_batch_plan,
     select_frozen_student_observation,
     write_frozen_student_columns,
 )
 
 
 class Hd2ShardTests(unittest.TestCase):
+    def test_official_epoch_retains_half_final_batch(self):
+        plan = official_epoch_batch_plan(8000000, 5120)
+        self.assertEqual(plan["optimizer_steps"], 1563)
+        self.assertEqual(plan["final_batch_size"], 2560)
+        self.assertFalse(plan["drop_last"])
+        self.assertEqual(plan["full_batches"] * 5120 + plan["final_batch_size"], 8000000)
+
     def test_converter_uses_authoritative_hd1_columns_not_first_17_per_limb(self):
         columns_path = ROOT / "tools" / "hd1_student_columns.json"
         columns, raw = load_frozen_hd1_columns(columns_path)

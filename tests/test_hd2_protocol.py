@@ -1,4 +1,5 @@
 import json
+import pickle
 import sys
 import tempfile
 import unittest
@@ -9,7 +10,11 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.hd2_protocol import prepare_pd_inventory  # noqa: E402
-from tools.run_hyperdistill_hd2a import PROTOCOL, prepare_inventory_stage, serialize_status, STATUS_KEYS, sha256, verify_resume_run  # noqa: E402
+from tools.run_hyperdistill_hd2a import (  # noqa: E402
+    PROTOCOL, archive_stale_failure, prepare_inventory_stage, resolve_resume_stage,
+    serialize_status, STATUS_KEYS, sha256, validate_converted_stage, validate_student_stage,
+    verify_resume_run,
+)
 
 
 class Hd2ProtocolTests(unittest.TestCase):
@@ -105,6 +110,51 @@ class Hd2ProtocolTests(unittest.TestCase):
             (run / "expert_shards" / "floor-pd-0.npz").write_bytes(b"tampered")
             with self.assertRaisesRegex(ValueError, "RESUME_REJECTED"):
                 verify_resume_run(run, config, checkpoint)
+
+    def test_completed_downstream_stages_promote_without_rerun(self):
+        import torch
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            run = Path(temporary); selection = []
+            expert = run / "expert_shards"; expert.mkdir()
+            converted = run / "converted_shards"; converted.mkdir()
+            columns = (ROOT / "tools" / "hd1_student_columns.json").read_bytes()
+            (converted / "student_columns.json").write_bytes(columns)
+            for index in range(10):
+                pd_id = f"floor-pd-{index}"; selection.append({"pd_robot_id": pd_id})
+                source = expert / f"{pd_id}.npz"; source.write_bytes(pd_id.encode())
+                with (converted / f"{pd_id}.pkl").open("wb") as stream:
+                    pickle.dump({"manifest": {"pd_robot_id": pd_id, "source_sha256": sha256(source)}}, stream)
+            selection_path = run / "selection.json"; selection_path.write_text(json.dumps(selection))
+            audit = {"HD2A_SHARDED_DATASET": "PASS", "HD2A_MAPPER_IDENTITY": "PASS", "FROZEN_HD1_COLUMNS_LENGTH": 204,
+                     "FROZEN_HD1_COLUMNS_HASH": "PASS", "HD2_CONVERTER_USES_FROZEN_COLUMNS": "PASS",
+                     "HD2_CONVERTER_DOES_NOT_DERIVE_FIRST_17_PER_LIMB": "PASS", "HD2_OUTPUT_COLUMNS_EQUALS_HD1": "PASS",
+                     "student_columns_sha256": sha256(converted / "student_columns.json"), "shard_count": 10}
+            (converted / "conversion_audit.json").write_text(json.dumps(audit))
+            state, result = resolve_resume_stage(run, "converted_shards", "conversion_audit.json", lambda: validate_converted_stage(run, selection_path))
+            self.assertEqual((state, result["CONVERT_STAGE"]), ("SKIP", "REUSED_VERIFIED"))
+            student = run / "student"; student.mkdir()
+            metrics = {"HD2A_TASK_BALANCE": "PASS", "HD2A_EFFECTIVE_BATCH_5120": "PASS", "HD2A_CONTEXT_DROPOUT": "PASS",
+                       "HD2A_CHECKPOINT_RELOAD": "PASS", "HD2_EFFECTIVE_BATCH_SIZE": 5120, "HD2_BATCH_IMPLEMENTATION": "physical",
+                       "microbatch": 5120, "optimizer_updates": 1}
+            (student / "hd2a_update_metrics.json").write_text(json.dumps(metrics))
+            torch.save({"mu_net": {}, "optimizer": {}, "seed": 1409}, student / "checkpoint_000.pt")
+            state, result = resolve_resume_stage(run, "student", "hd2a_update_metrics.json", lambda: validate_student_stage(run))
+            self.assertEqual((state, result["STUDENT_PREFLIGHT_STAGE"]), ("SKIP", "REUSED_VERIFIED"))
+            audit["student_columns_sha256"] = "corrupt"; (converted / "conversion_audit.json").write_text(json.dumps(audit))
+            with self.assertRaisesRegex(ValueError, "RESUME_REJECTED"):
+                resolve_resume_stage(run, "converted_shards", "conversion_audit.json", lambda: validate_converted_stage(run, selection_path))
+
+    def test_absent_incomplete_and_stale_failure_resume_states(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            run = Path(temporary)
+            self.assertEqual(resolve_resume_stage(run, "converted_shards", "conversion_audit.json", lambda: {}), ("RUN", None))
+            (run / "converted_shards").mkdir()
+            self.assertEqual(resolve_resume_stage(run, "converted_shards", "conversion_audit.json", lambda: {}), ("RUN", "CLEARED_INCOMPLETE"))
+            self.assertFalse((run / "converted_shards").exists())
+            (run / "failure.txt").write_text("old failure")
+            archive_stale_failure(run)
+            self.assertFalse((run / "failure.txt").exists())
+            self.assertTrue((run / "attempt_history" / "attempt_002_failure.txt").is_file())
 
 
 if __name__ == "__main__":
