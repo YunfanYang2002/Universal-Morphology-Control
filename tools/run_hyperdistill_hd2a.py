@@ -26,6 +26,17 @@ HD2A_CONTEXT_DROPOUT HD2A_CHECKPOINT_RELOAD HD2A_FINAL""".split()
 AUDIT_SUFFIXES = {".json", ".yaml", ".yml", ".txt", ".log", ".csv", ".md"}
 
 
+def prepare_inventory_stage(config: Path, ood_pool: Path, pd_source: Path, run_root: Path) -> tuple[Path, dict]:
+    """Give the protocol-owned child directory to the fail-closed inventory creator."""
+    inventory_dir = run_root / "pd_inventory"
+    inventory = prepare_pd_inventory(config, ood_pool, pd_source, inventory_dir, preflight_count=10)
+    return inventory_dir, inventory
+
+
+def serialize_status(status: dict) -> dict:
+    return {key: ("NOT_MEASURED" if key == "HD2A_FINAL" else "NOT_RUN") if value is None else value for key, value in status.items()}
+
+
 def package(output: Path) -> Path:
     manifest_path = output / "manifest.json"; manifest = json.loads(manifest_path.read_text())
     files = [path for path in output.rglob("*") if path.is_file() and path != manifest_path and "temp" not in path.relative_to(output).parts]
@@ -52,7 +63,7 @@ def main():
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     output = ROOT / "tmp" / f"hyperdistill_hd2a_preflight_{stamp}"; (output / "temp").mkdir(parents=True)
     for key in ("TMP", "TEMP", "TMPDIR"): os.environ[key] = str(output / "temp")
-    status = {key: "FAIL" for key in STATUS_KEYS}; unmeasured = set(STATUS_KEYS)
+    status = {key: None for key in STATUS_KEYS}; unmeasured = set(STATUS_KEYS)
     manifest = {"protocol": PROTOCOL, "stages": [], "unmeasured": [], "commands": [], "python": sys.executable,
                 "python_version": sys.version, "host": platform.node(), "platform": platform.platform(),
                 "arguments": {key: str(value) for key, value in vars(args).items()}}
@@ -85,8 +96,8 @@ def main():
         for name in ("torch", "numpy", "gym", "mujoco-py", "PyYAML"):
             try: manifest["environment_versions"][name] = importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError: manifest["environment_versions"][name] = "NOT_AVAILABLE"
-        inventory = prepare_pd_inventory(config, ood_pool, args.pd_source, output, preflight_count=10)
-        update({"HD2A_PD_GENERATION": "PASS"}); selection = output / "provenance" / "mutation_manifest.json"; walker_dir = output / "pd1000"
+        inventory_dir, inventory = prepare_inventory_stage(config, ood_pool, args.pd_source, output)
+        update({"HD2A_PD_GENERATION": "PASS"}); selection = inventory_dir / "provenance" / "mutation_manifest.json"; walker_dir = inventory_dir / "pd1000"
         common = ["--rmamorph-root", teacher_root, "--config", config, "--checkpoint", checkpoint, "--manifest", selection, "--walker-dir", walker_dir]
         stage("pd_validity", "hd2_teacher_export.py", ["validate", *common, "--output", output / "pd_validity"], teacher_root)
         validity = json.loads((output / "pd_validity" / "pd_validity.json").read_text()); update({"HD2A_PD_VALIDITY": "PASS" if validity["HD2_PD_VALIDITY"] == "PASS" else "FAIL"})
@@ -103,9 +114,10 @@ def main():
     except Exception:
         manifest["failure"] = traceback.format_exc(); (output / "failure.txt").write_text(manifest["failure"]); print(manifest["failure"], file=sys.stderr)
     finally:
-        manifest["status"] = status; manifest["unmeasured"] = sorted(unmeasured); manifest["HD2B"] = "NOT_AUTHORIZED; this launcher never starts full HD2B"
-        (output / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False)); (output / "status.json").write_text(json.dumps(status, indent=2))
-        (output / "status.txt").write_text("\n".join(f"{key}={value}" for key, value in status.items()) + "\n")
+        serialized_status = serialize_status(status)
+        manifest["status"] = serialized_status; manifest["unmeasured"] = sorted(unmeasured); manifest["HD2B"] = "NOT_AUTHORIZED; this launcher never starts full HD2B"
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False)); (output / "status.json").write_text(json.dumps(serialized_status, indent=2))
+        (output / "status.txt").write_text("\n".join(f"{key}={value}" for key, value in serialized_status.items()) + "\n")
         print((output / "status.txt").read_text(), end=""); print(f"OUTPUT_ZIP={package(output)}")
     return code
 

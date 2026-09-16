@@ -9,6 +9,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.hd2_protocol import prepare_pd_inventory  # noqa: E402
+from tools.run_hyperdistill_hd2a import prepare_inventory_stage, serialize_status, STATUS_KEYS  # noqa: E402
 
 
 class Hd2ProtocolTests(unittest.TestCase):
@@ -43,6 +44,33 @@ class Hd2ProtocolTests(unittest.TestCase):
             self.assertEqual(result["HD2_PD_ROBOT_COUNT"], 1000)
             self.assertEqual(len(result["selected_pd_robots"]), 10)
             self.assertEqual(len({row["parent_walker_id"] for row in result["selected_pd_robots"]}), 10)
+
+    def test_runner_owned_root_and_protocol_owned_inventory_fail_closed(self):
+        source = ROOT / "data" / "train_mutate_1000"
+        parents = sorted(path.stem for path in (source / "metadata").glob("*.json") if "-mutate-" not in path.stem)
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            run_root = Path(temporary) / "hyperdistill_hd2a_preflight_test"
+            run_root.mkdir()
+            (run_root / "frozen_protocol.json").write_text("{}")
+            (run_root / "teacher_config.yaml").write_text("frozen: true\n")
+            config = run_root / "teacher_train100.yaml"
+            config.write_text(yaml.safe_dump({"ENV": {"WALKERS": parents}}))
+            ood = run_root / "ood.txt"; ood.write_text("floor-heldout\n")
+            inventory_dir = run_root / "pd_inventory"
+            self.assertTrue(run_root.exists())
+            self.assertFalse(inventory_dir.exists())
+            created, result = prepare_inventory_stage(config, ood, source, run_root)
+            self.assertEqual(created, inventory_dir)
+            self.assertTrue(created.exists())
+            self.assertEqual(result["HD2_PD_PROVENANCE"], "PASS")
+            with self.assertRaises(FileExistsError):
+                prepare_inventory_stage(config, ood, source, run_root)
+
+    def test_unexecuted_gates_are_not_serialized_as_failures(self):
+        status = {key: None for key in STATUS_KEYS}
+        serialized = serialize_status(status)
+        self.assertTrue(all(serialized[key] == "NOT_RUN" for key in STATUS_KEYS if key != "HD2A_FINAL"))
+        self.assertEqual(serialized["HD2A_FINAL"], "NOT_MEASURED")
 
 
 if __name__ == "__main__":
