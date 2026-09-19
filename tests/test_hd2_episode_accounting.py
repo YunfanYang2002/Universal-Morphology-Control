@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.hd2_collection_accounting_audit import corrected_row, write_corrected_audit  # noqa: E402
-from tools.hd2_teacher_export import _verified_existing_collection, teacher_coverage_summary  # noqa: E402
+from tools.hd2_teacher_export import collection_resume_plan, teacher_coverage_summary  # noqa: E402
 
 
 class Hd2EpisodeAccountingTests(unittest.TestCase):
@@ -44,14 +44,16 @@ class Hd2EpisodeAccountingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
             output = Path(temporary); pd_id = "floor-pd-0"; shard = output / f"{pd_id}.npz"; shard.write_bytes(b"complete")
             digest = hashlib.sha256(shard.read_bytes()).hexdigest()
-            row = {"pd_robot_id": pd_id, "transition_count": 8000, "shard_sha256": digest,
-                   "episode_length_distribution": [7998], "teacher_return_distribution": [0.0], "early_termination_count": 0}
-            (output / "collection_metrics.json").write_text(json.dumps({"per_robot": [row]}))
-            verified = _verified_existing_collection(output, [{"pd_robot_id": pd_id}])
-            self.assertEqual(verified[pd_id]["final_partial_episode_steps"], 2)
+            validator = lambda path, entry: {"pd_robot_id": entry["pd_robot_id"], "transition_count": 8000,
+                                               "shard_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                               "resume_source": "LEGACY_SHARD_VALIDATED", "coverage_metrics_available": False}
+            verified, needed, _ = collection_resume_plan(output, [{"pd_robot_id": pd_id}], legacy_validator=validator, log=lambda _: None)
+            self.assertEqual(verified[pd_id]["resume_source"], "LEGACY_SHARD_VALIDATED")
+            self.assertEqual(needed, [])
             shard.write_bytes(b"tampered")
-            with self.assertRaisesRegex(ValueError, "hash-mismatched"):
-                _verified_existing_collection(output, [{"pd_robot_id": pd_id}])
+            verified, needed, _ = collection_resume_plan(output, [{"pd_robot_id": pd_id}], legacy_validator=lambda *_: (_ for _ in ()).throw(ValueError("invalid")), log=lambda _: None)
+            self.assertEqual(verified, {})
+            self.assertEqual(needed, [{"pd_robot_id": pd_id}])
 
 
 if __name__ == "__main__":

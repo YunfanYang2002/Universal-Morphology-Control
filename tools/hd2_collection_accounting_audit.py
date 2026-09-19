@@ -37,6 +37,7 @@ def corrected_row(row: dict) -> dict:
         "episodes_started": len(lengths) + int(partial > 0),
         "episode_count_required_to_reach_8000_semantics": "DEPRECATED: completed terminal episodes only; use episodes_started",
     })
+    corrected.setdefault("coverage_metrics_available", all(key in corrected for key in ("teacher_return_distribution", "episode_length_distribution", "early_termination_count")))
     return corrected
 
 
