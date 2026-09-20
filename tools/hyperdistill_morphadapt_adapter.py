@@ -110,6 +110,8 @@ class FrozenHyperDistillPolicy:
         self._bound_obs_mask = None
         self._bound_act_mask = None
         self._bound_context = None
+        self._bind_count = 0
+        self._generation_count = 0
         self._walker = None
         self._reported_finite = False
         self._reported_context_free = False
@@ -126,6 +128,8 @@ class FrozenHyperDistillPolicy:
         self._bound_obs_mask = None
         self._bound_act_mask = None
         self._bound_context = None
+        self._bind_count = 0
+        self._generation_count = 0
 
     @staticmethod
     def _validated_mask(value, expected_shape, label):
@@ -188,6 +192,7 @@ class FrozenHyperDistillPolicy:
         if context.shape != (1, MAX_LIMBS * 35) or not torch.isfinite(context).all():
             raise FloatingPointError("generated static HyperDistill context is invalid")
         self.mu_net.generate_params(context.to(self.device), bound_obs_mask.reshape(1, -1).to(self.device))
+        self._generation_count += 1
         generated = [
             self.mu_net.input_weight, self.mu_net.input_bias,
             self.mu_net.output_weight, self.mu_net.output_bias,
@@ -201,7 +206,14 @@ class FrozenHyperDistillPolicy:
         self._bound_obs_mask = bound_obs_mask.to(self.device)
         self._bound_act_mask = bound_act_mask.to(self.device)
         self._context_bound = True
+        self._bind_count += 1
         print("FORMAL_CONTEXT_BINDING=PASS", flush=True)
+
+    def episode_audit(self) -> dict[str, int]:
+        return {
+            "hn_bind_count": self._bind_count,
+            "hn_generation_count": self._generation_count,
+        }
 
     @torch.no_grad()
     def action(self, obs):

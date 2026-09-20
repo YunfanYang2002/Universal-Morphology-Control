@@ -25,3 +25,22 @@ bash tools/run_hyperdistill_strict_ood97_nominal_server.sh
 The runner writes the formal evidence package below project `./tmp/` and
 fails closed if the 97-ID identity, train overlap, PD1000 exact-ID overlap,
 checkpoints, or evaluator inputs are unavailable or inconsistent.
+
+The runtime-mutation comparison is a separate evaluation-only orchestration
+path. It reuses the same student adapter, static-context binding, checkpoint,
+Strict-OOD97 identity, and rmamorph evaluator, while enabling the authoritative
+mid-episode mutation protocols `nominal`, `id`, `ood_mild`, and `ood_strong`.
+The policy binds and generates its morphology-specific parameters once at
+reset, before mutation; the runner records the bind/generation counts and
+preserves each protocol's raw evaluator result and audit log.
+
+On the server:
+
+```bash
+bash tools/run_hyperdistill_strict_ood97_mutation_server.sh
+```
+
+Use `--resume-run ./tmp/<existing-run>` only when the checkpoint hash,
+identity hash, seed, horizon, and mutation step match the run's completion
+markers. The launcher performs one nominal one-walker mutation smoke before
+the four 97-walker protocols and writes the final audit ZIP below `./tmp/`.
