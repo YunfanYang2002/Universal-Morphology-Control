@@ -11,3 +11,5 @@ data_single_robot/
 distilled_policy/
 eval/
 expert_data/
+
+tmp/*

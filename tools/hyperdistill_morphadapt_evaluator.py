@@ -2,16 +2,108 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _evaluator_args_contract(evaluator):
+    """Return all ``args.<field>`` reads in evaluate_protocol and helpers."""
+    source = Path(evaluator.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    protocol = functions.get("evaluate_protocol")
+    if protocol is None:
+        raise AttributeError("rmamorph evaluator has no evaluate_protocol function")
+
+    fields = set()
+    helper_names = set()
+    for node in ast.walk(protocol):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "args":
+            fields.add(node.attr)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in functions:
+            if any(isinstance(argument, ast.Name) and argument.id == "args" for argument in node.args):
+                helper_names.add(node.func.id)
+            if any(isinstance(keyword.value, ast.Name) and keyword.value.id == "args" for keyword in node.keywords):
+                helper_names.add(node.func.id)
+    for helper_name in helper_names:
+        for node in ast.walk(functions[helper_name]):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "args":
+                fields.add(node.attr)
+    return tuple(sorted(fields))
+
+
+def _parser_default_namespace(evaluator):
+    """Obtain defaults from rmamorph's own parser instead of duplicating them."""
+    parser_factory = getattr(evaluator, "build_parser", None)
+    if callable(parser_factory):
+        parser = parser_factory()
+        return parser.parse_args([
+            "--cfg", "__hyperdistill_formal_cfg__",
+            "--checkpoint", "__hyperdistill_formal_checkpoint__",
+            "--walkers-file", "__hyperdistill_formal_walkers__",
+            "--out", "__hyperdistill_formal_out__",
+        ])
+    parse_args = getattr(evaluator, "parse_args", None)
+    if callable(parse_args):
+        original_argv = sys.argv
+        sys.argv = [
+            "evaluate_dynamics.py",
+            "--cfg", "__hyperdistill_formal_cfg__",
+            "--checkpoint", "__hyperdistill_formal_checkpoint__",
+            "--walkers-file", "__hyperdistill_formal_walkers__",
+            "--out", "__hyperdistill_formal_out__",
+        ]
+        try:
+            return parse_args()
+        finally:
+            sys.argv = original_argv
+    return SimpleNamespace(
+        trace_out=None,
+        trace_identity=None,
+        replay_out=None,
+        action_history_intervention="aligned",
+        post_response_intervention=False,
+        episodes_per_walker=1,
+        max_steps_per_walker=1000,
+    )
+
+
+def _build_formal_args(evaluator):
+    fields = set(_evaluator_args_contract(evaluator))
+    namespace = _parser_default_namespace(evaluator)
+    # trace_identity is initialized by evaluate_dynamics.main after parsing;
+    # evaluate_protocol still requires the attribute even when tracing is off.
+    overrides = {
+        "trace_out": None,
+        "trace_identity": None,
+        "replay_out": None,
+        "action_history_intervention": "aligned",
+        "post_response_intervention": False,
+        "episodes_per_walker": 1,
+        "max_steps_per_walker": 1000,
+    }
+    for name, value in overrides.items():
+        setattr(namespace, name, value)
+    missing = sorted(name for name in fields if not hasattr(namespace, name))
+    if missing:
+        raise AttributeError(f"MISSING_EVALUATOR_ARGS={','.join(missing)}")
+    print("FORMAL_ARGS_CONTRACT=PASS", flush=True)
+    print("MISSING_EVALUATOR_ARGS=0", flush=True)
+    return namespace
 
 
 def _load_adapter():
@@ -169,11 +261,7 @@ def main() -> int:
     evaluator.select_action = select_action
     evaluator.evaluate_walker = evaluate_walker
     try:
-        args_obj = type("FormalArgs", (), {
-            "trace_out": None, "trace_identity": None,
-            "action_history_intervention": "aligned", "post_response_intervention": False,
-            "episodes_per_walker": 1, "max_steps_per_walker": 1000,
-        })()
+        args_obj = _build_formal_args(evaluator)
         result = evaluator.evaluate_protocol(policy, ob_rms, "nominal", walkers, [args.eval_seed], args_obj)
     finally:
         env_module.make_vec_envs = original_make
