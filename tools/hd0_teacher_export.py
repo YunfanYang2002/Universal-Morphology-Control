@@ -334,6 +334,7 @@ def main() -> None:
 
     student = None
     student_by_walker: dict[str, Any] = {}
+    student_sha_by_walker: dict[str, str] = {}
     student_columns = None
     student_sha = None
     if args.student_policy:
@@ -351,6 +352,7 @@ def main() -> None:
         for walker in walkers:
             policy_path = require_file(policy_dir / f"{walker}.ts", f"student policy ({walker})")
             student_by_walker[walker] = torch.jit.load(str(policy_path), map_location=device).eval()
+            student_sha_by_walker[walker] = sha256_file(policy_path)
 
     if args.teacher_reference:
         reference = resolve(root, args.teacher_reference)
@@ -397,6 +399,8 @@ def main() -> None:
             student_displacements: list[float] = []
             reasons: list[str] = []
             squared_errors: list[np.ndarray] = []
+            episode_squared_errors: list[np.ndarray] = []
+            student_episode_metrics: list[dict[str, Any]] = []
             try:
                 raw_env = base_env(env)
                 obs = env.reset()
@@ -425,7 +429,9 @@ def main() -> None:
                         raise ValueError("frozen HD1 student policy emitted nonzero padded actions")
                     valid, low, high = policy_action_spec(raw_env.action_space.low, raw_env.action_space.high, act_mask, None)
                     canonical_student = canonicalize_executed_action(student_action, valid, low, high).astype(np.float32, copy=False)
-                    squared_errors.append((student_action[~act_mask] - teacher_mean[~act_mask]) ** 2)
+                    valid_squared_error = (student_action[~act_mask] - teacher_mean[~act_mask]) ** 2
+                    squared_errors.append(valid_squared_error)
+                    episode_squared_errors.append(valid_squared_error)
                     obs, rewards, dones, infos = env.step(torch.as_tensor(canonical_student, device=device).unsqueeze(0))
                     if not np.isfinite(tensor_to_numpy(rewards)).all() or infos[0].get("mj_step_error"):
                         raise FloatingPointError("HD1 student rollout numerical failure")
@@ -440,11 +446,21 @@ def main() -> None:
                         student_lengths.append(int(episode["l"]))
                         student_displacements.append(float(infos[0]["x_pos"]) - start_x)
                         reasons.append("horizon" if infos[0].get("timeout") else "early_termination")
+                        student_episode_metrics.append({
+                            "episode_index": completed,
+                            "return": student_returns[-1],
+                            "length": student_lengths[-1],
+                            "forward_displacement": student_displacements[-1],
+                            "termination_reason": reasons[-1],
+                            "numerical_failures": 0,
+                            "action_mse_valid": float(np.concatenate(episode_squared_errors).mean()),
+                        })
                         completed += 1
                         if completed < 3:
                             if not np.array_equal(native_raw_context(raw_env, max_limbs), reference_contexts[int(expected_episodes[completed])]):
                                 raise ValueError(f"student reset context differs from frozen teacher context for {walker} episode {completed}")
                             start_x = float(raw_env.sim.data.qpos[0])
+                            episode_squared_errors = []
             finally:
                 env.close()
             start = walker_index * 3
@@ -454,6 +470,9 @@ def main() -> None:
                                  "teacher_episode_lengths": reference_manifest["teacher_episode_lengths"][start:start + 3],
                                  "student_episode_returns": student_returns, "student_episode_lengths": student_lengths,
                                  "student_forward_displacements": student_displacements, "termination_reasons": reasons,
+                                 "student_episode_metrics": student_episode_metrics,
+                                 "student_policy_sha256": student_sha_by_walker[walker],
+                                 "teacher_episode_metrics": teacher_records,
                                  "teacher_forward_displacements": [r["forward_displacement"] for r in teacher_records],
                                  "teacher_termination_reasons": [r["termination_reason"] for r in teacher_records],
                                  "student_early_terminations": sum(r == "early_termination" for r in reasons),
