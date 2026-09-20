@@ -126,6 +126,7 @@ def main() -> int:
     from metamorph.algos.ppo import envs as env_module
 
     evaluator.canonical_runtime_config_from_resolved(args.config.resolve(), ["ENV.WALKER_DIR", str(args.walker_root.resolve())])
+    print("RMAMORPH_CFG_ACTIVE=YES", flush=True)
     cfg.DISTRIBUTED = False
     cfg.RANK = 0
     cfg.LOCAL_RANK = 0

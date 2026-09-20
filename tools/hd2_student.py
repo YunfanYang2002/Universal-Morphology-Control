@@ -14,16 +14,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.optim as optim
-from gym import spaces
 from torch.utils.data import IterableDataset
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from metamorph.algos.distill.distill import _hd0_check_finite, _hd0_tensor  # noqa: E402
-from metamorph.algos.ppo.model import ActorCritic  # noqa: E402
 from metamorph.config import cfg  # noqa: E402
 from tools.convert_rmamorph_teacher_to_hyperdistill import nominal_context  # noqa: E402
+from tools.hd2_student_constructor import build_hd2_student_actor  # noqa: E402
 
 try:
     import resource
@@ -221,15 +220,11 @@ def configure_hd2(cfg_path: str, seed: int) -> None:
                          "ENV.KEYS_TO_KEEP", []])
 
 
-def _make_model(batch: dict) -> ActorCritic:
+def _make_model(batch: dict):
     max_limbs = int(batch["obs_mask"].shape[-1])
-    cfg.MODEL.MAX_LIMBS = max_limbs
-    obs_space = spaces.Dict({"proprioceptive": spaces.Box(-np.inf, np.inf, shape=(batch["obs"].shape[1],), dtype=np.float32),
-                              "context": spaces.Box(-np.inf, np.inf, shape=(batch["context"].shape[-1],), dtype=np.float32),
-                              "obs_padding_mask": spaces.Box(0, 1, shape=(max_limbs,), dtype=np.bool_),
-                              "act_padding_mask": spaces.Box(0, 1, shape=(max_limbs * 2,), dtype=np.bool_),
-                              "adjacency_matrix": spaces.Box(-np.inf, np.inf, shape=(max_limbs, max_limbs), dtype=np.float32)})
-    return ActorCritic(obs_space, spaces.Box(-np.inf, np.inf, shape=(max_limbs * 2,), dtype=np.float32)).cuda()
+    if max_limbs != 12 or batch["obs"].shape[1] != 204 or batch["context"].shape[-1] != 420:
+        raise ValueError("HD2 frozen student construction requires obs=204, context=420, max_limbs=12")
+    return build_hd2_student_actor(device=torch.device("cuda"))
 
 
 def _loss(model, batch, device):

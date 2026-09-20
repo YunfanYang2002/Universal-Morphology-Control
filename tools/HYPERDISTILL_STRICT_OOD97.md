@@ -6,7 +6,9 @@ Both use the current MorphAdapt formal contract: the frozen Strict-OOD97
 identity, nominal dynamics, evaluation seed 1409, one episode per walker, and
 a 1000-step horizon. No optimizer or dynamics-mutation stage is invoked.
 
-The adapter is `tools/hyperdistill_morphadapt_adapter.py`. The rollout process
+The adapter is `tools/hyperdistill_morphadapt_adapter.py`; it reuses the
+namespace-independent HD2 student constructor used by HD2B/HD2C and never
+mutates rmamorph's teacher `cfg`. The rollout process
 calls `rmamorph/tools/evaluate_dynamics.py` through
 `tools/hyperdistill_morphadapt_evaluator.py`; it supplies only the frozen
 HyperDistill action and leaves environment, termination, return, tracking, and
@@ -15,7 +17,7 @@ aggregation semantics in the canonical evaluator.
 On the server, after the repository and frozen MorphAdapt assets are present:
 
 ```bash
-bash tools/run_hyperdistill_strict_ood97_server.sh
+bash tools/run_hyperdistill_strict_ood97_nominal_server.sh
 ```
 
 The runner writes the formal evidence package below project `./tmp/` and

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import torch
 
-from tools.hyperdistill_morphadapt_adapter import FrozenHyperDistillPolicy, _HNMLP
-from metamorph.config import cfg
+from tools.hd2_student_constructor import build_hd2_hnmlp_model
+from tools.hyperdistill_morphadapt_adapter import FrozenHyperDistillPolicy
 
 
 class HyperDistillMorphAdaptAdapterTests(unittest.TestCase):
@@ -14,10 +14,7 @@ class HyperDistillMorphAdaptAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="tmp") as directory:
             root = Path(directory)
             checkpoint = root / "checkpoint_030.pt"
-            cfg.MODEL.MLP.LAYER_NUM = 2
-            cfg.MODEL.MLP.DROPOUT = None
-            cfg.MODEL.HYPERNET.EMBEDDING_DROPOUT = 0.1
-            model = _HNMLP()
+            model = build_hd2_hnmlp_model()
             torch.save({
                 "mu_net": model.state_dict(), "optimizer": {}, "seed": 1409,
                 "completed_epoch": 30, "cumulative_optimizer_steps": 30 * 1563,

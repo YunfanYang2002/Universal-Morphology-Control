@@ -24,6 +24,10 @@ DEFAULT_TEST_ROOT = Path("/home/yyf/Workspace/Code/rmamorph/output/unimals_100/t
 DEFAULT_RMAMORPH = Path.home() / "Workspace/Code/rmamorph"
 FORMAL_EVAL_EPISODES = 1
 FORMAL_HORIZON = 1000
+EXPECTED_CHECKPOINT_SHA256 = {
+    150: "bf3968c6634fc541522b168b9100ab99c2ad8e619f43c2437860e2a50784c0cf",
+    30: "08621d8c3958ef180351465cb451509200e35bbe322c3629333e9517b8bf1941",
+}
 
 
 def sha256(path: Path) -> str:
@@ -112,7 +116,10 @@ def _checkpoint_audit(path: Path, expected_epoch: int) -> dict:
         raise ValueError(f"checkpoint_{expected_epoch:03d}.pt violates the frozen HD2B counters")
     if not isinstance(state["mu_net"], dict) or not all(torch.is_tensor(v) and torch.isfinite(v).all() for v in state["mu_net"].values()):
         raise ValueError(f"checkpoint_{expected_epoch:03d}.pt contains an invalid mu_net state")
-    return {"epoch": expected_epoch, "path": str(path.resolve()), "sha256": sha256(path), "schema": "PASS", "finite": "PASS", "optimizer_loaded": False}
+    digest = sha256(path)
+    if digest != EXPECTED_CHECKPOINT_SHA256[expected_epoch]:
+        raise ValueError(f"checkpoint_{expected_epoch:03d}.pt SHA256 mismatch: {digest}")
+    return {"epoch": expected_epoch, "path": str(path.resolve()), "sha256": digest, "schema": "PASS", "finite": "PASS", "optimizer_loaded": False}
 
 
 def _run_evaluator(output: Path, args, checkpoint: Path, epoch: int, walkers: Path, config: Path, teacher_checkpoint: Path) -> None:
