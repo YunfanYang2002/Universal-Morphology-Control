@@ -38,6 +38,19 @@ HNMLP = _HD2.HNMLP
 build_hd2_hnmlp_model = _HD2.build_hd2_hnmlp_model
 
 
+def _load_hd0_helpers():
+    source = ROOT / "tools" / "hd0_teacher_export.py"
+    spec = importlib.util.spec_from_file_location("hyperdistill_hd0_teacher_export", source)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load authoritative HD0 context helpers: {source}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_HD0 = _load_hd0_helpers()
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -93,9 +106,13 @@ class FrozenHyperDistillPolicy:
             parameter.requires_grad_(False)
         self.checkpoint_epoch = epoch
         self._context_hash = None
-        self._generated = False
+        self._context_bound = False
+        self._bound_obs_mask = None
+        self._bound_act_mask = None
+        self._bound_context = None
         self._walker = None
         self._reported_finite = False
+        self._reported_context_free = False
         print("HD2_STUDENT_CONSTRUCTOR_REUSED=PASS", flush=True)
         print("RMAMORPH_HYPERDISTILL_CONFIG_ISOLATION=PASS", flush=True)
         print("HYPERDISTILL_POLICY_INIT=PASS", flush=True)
@@ -105,7 +122,28 @@ class FrozenHyperDistillPolicy:
     def begin_walker(self, walker: str, seed: int) -> None:
         self._walker = (str(walker), int(seed))
         self._context_hash = None
-        self._generated = False
+        self._context_bound = False
+        self._bound_obs_mask = None
+        self._bound_act_mask = None
+        self._bound_context = None
+
+    @staticmethod
+    def _validated_mask(value, expected_shape, label):
+        mask = torch.as_tensor(value)
+        if tuple(mask.reshape(-1).shape) != expected_shape:
+            raise ValueError(f"{label} must have shape {expected_shape}, got {tuple(mask.shape)}")
+        flat = mask.reshape(expected_shape)
+        if not torch.all((flat == 0) | (flat == 1)):
+            raise ValueError(f"{label} must contain only boolean values")
+        return flat.bool()
+
+    @staticmethod
+    def _raw_context_from_env(raw_env):
+        if hasattr(raw_env, "modules") and hasattr(raw_env, "sim"):
+            native = raw_env
+        else:
+            native = _HD0.base_env(raw_env)
+        return _HD0.native_raw_context(native, MAX_LIMBS)
 
     @staticmethod
     def _context(raw_context, obs_mask, act_mask):
@@ -128,31 +166,67 @@ class FrozenHyperDistillPolicy:
         return torch.from_numpy(result).reshape(1, -1)
 
     @torch.no_grad()
+    def bind_morphology(self, *, raw_env=None, raw_context=None, obs_mask, act_mask) -> None:
+        """Bind one reset-time morphology and generate its frozen HN parameters."""
+        if self._context_bound:
+            raise RuntimeError("HyperDistill morphology is already bound for this walker")
+        if raw_context is None:
+            if raw_env is None:
+                raise ValueError("bind_morphology requires raw_env or raw_context")
+            raw_context = self._raw_context_from_env(raw_env)
+        raw = torch.as_tensor(raw_context).detach().cpu().numpy().astype(np.float32, copy=False)
+        if raw.shape != (MAX_LIMBS, 35) or not np.isfinite(raw).all():
+            raise ValueError(f"static morphology context must be finite with shape {(MAX_LIMBS, 35)}")
+        print("STATIC_CONTEXT_FINITE=PASS", flush=True)
+
+        bound_obs_mask = self._validated_mask(obs_mask, (MAX_LIMBS,), "obs_mask")
+        bound_act_mask = self._validated_mask(act_mask, (ACTION_DIM,), "act_mask")
+        print("CONTEXT_DIM=420", flush=True)
+        print("OBS_MASK_VALID=PASS", flush=True)
+        print("ACT_MASK_VALID=PASS", flush=True)
+        context = self._context(raw, bound_obs_mask, bound_act_mask)
+        if context.shape != (1, MAX_LIMBS * 35) or not torch.isfinite(context).all():
+            raise FloatingPointError("generated static HyperDistill context is invalid")
+        self.mu_net.generate_params(context.to(self.device), bound_obs_mask.reshape(1, -1).to(self.device))
+        generated = [
+            self.mu_net.input_weight, self.mu_net.input_bias,
+            self.mu_net.output_weight, self.mu_net.output_bias,
+            *self.mu_net.hidden_weights, *self.mu_net.hidden_bias,
+        ]
+        if not all(torch.isfinite(value).all() for value in generated):
+            raise FloatingPointError("generated HyperDistill policy parameters are non-finite")
+        print("GENERATED_POLICY_FINITE=PASS", flush=True)
+        self._context_hash = hashlib.sha256(context.numpy().tobytes()).hexdigest()
+        self._bound_context = context.to(self.device)
+        self._bound_obs_mask = bound_obs_mask.to(self.device)
+        self._bound_act_mask = bound_act_mask.to(self.device)
+        self._context_bound = True
+        print("FORMAL_CONTEXT_BINDING=PASS", flush=True)
+
+    @torch.no_grad()
     def action(self, obs):
         proprio = torch.as_tensor(obs["proprioceptive"], device=self.device, dtype=torch.float32)
         if proprio.ndim != 2 or proprio.shape[1] != TEACHER_PROPRIO_DIM:
             raise ValueError(f"MorphAdapt evaluator proprioception shape must be [1, 624], got {tuple(proprio.shape)}")
-        obs_mask = torch.as_tensor(obs["obs_padding_mask"], device=self.device).bool().reshape(1, -1)
-        act_mask = torch.as_tensor(obs["act_padding_mask"], device=self.device).bool().reshape(1, -1)
-        if obs_mask.shape != (1, MAX_LIMBS) or act_mask.shape != (1, ACTION_DIM):
-            raise ValueError("MorphAdapt evaluator masks do not match frozen HD2B padding")
-        context = self._context(obs["context"], obs_mask[0], act_mask[0]).to(self.device)
-        context_hash = hashlib.sha256(context.detach().cpu().numpy().tobytes()).hexdigest()
-        if self._context_hash is None:
-            self._context_hash = context_hash
-            self.mu_net.generate_params(context, obs_mask)
-            self._generated = True
-        elif context_hash != self._context_hash:
-            raise RuntimeError("HyperDistill static morphology context changed after deployment initialization")
+        obs_mask = self._validated_mask(obs["obs_padding_mask"], (MAX_LIMBS,), "obs_padding_mask").to(self.device)
+        act_mask = self._validated_mask(obs["act_padding_mask"], (ACTION_DIM,), "act_padding_mask").to(self.device)
+        if not self._context_bound:
+            raise RuntimeError("HyperDistill static morphology context is not bound for this walker")
+        if not torch.equal(obs_mask, self._bound_obs_mask) or not torch.equal(act_mask, self._bound_act_mask):
+            raise RuntimeError("formal observation masks differ from the bound morphology masks")
         selected = proprio.index_select(1, self.columns)
-        output, _ = self.mu_net(selected, obs_mask)
+        output, _ = self.mu_net(selected, obs_mask.reshape(1, -1))
         output = output.clamp(-1.0, 1.0).masked_fill(act_mask, 0.0)
         if not torch.isfinite(output).all():
             raise FloatingPointError("HyperDistill policy action became non-finite")
-        if not torch.equal(output[act_mask], torch.zeros_like(output[act_mask])):
+        padded = output[:, act_mask]
+        if not torch.equal(padded, torch.zeros_like(padded)):
             raise AssertionError("HyperDistill padded action is not zero")
         if not self._reported_finite:
             print("POLICY_OUTPUT_FINITE=PASS", flush=True)
             print("PADDED_ACTION_ZERO=PASS", flush=True)
             self._reported_finite = True
+        if not self._reported_context_free:
+            print("NO_CONTEXT_KEY_REQUIRED=PASS", flush=True)
+            self._reported_context_free = True
         return output

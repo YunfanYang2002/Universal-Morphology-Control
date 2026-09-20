@@ -55,10 +55,15 @@ class HyperDistillEvaluatorContractTests(unittest.TestCase):
 
         observation = {
             "proprioceptive": torch.zeros(1, 624),
-            "context": torch.zeros(1, 420),
             "obs_padding_mask": torch.tensor([[False] * 4 + [True] * 8]),
             "act_padding_mask": torch.tensor([[False] * 8 + [True] * 16]),
         }
+        policy.begin_walker("synthetic", 1409)
+        policy.bind_morphology(
+            raw_context=torch.zeros(12, 35),
+            obs_mask=observation["obs_padding_mask"][0],
+            act_mask=observation["act_padding_mask"][0],
+        )
         original_evaluate_walker = evaluator.evaluate_walker
 
         def one_step_walker(model, ob_rms, walker, seed, episodes, max_steps, *call_args):

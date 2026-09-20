@@ -8,7 +8,9 @@ a 1000-step horizon. No optimizer or dynamics-mutation stage is invoked.
 
 The adapter is `tools/hyperdistill_morphadapt_adapter.py`; it reuses the
 namespace-independent HD2 student constructor used by HD2B/HD2C and never
-mutates rmamorph's teacher `cfg`. The rollout process
+mutates rmamorph's teacher `cfg`. At each walker reset it binds the static
+morphology context through the HD0 `base_env`/`native_raw_context` helpers;
+the per-step formal observation remains context-free. The rollout process
 calls `rmamorph/tools/evaluate_dynamics.py` through
 `tools/hyperdistill_morphadapt_evaluator.py`; it supplies only the frozen
 HyperDistill action and leaves environment, termination, return, tracking, and

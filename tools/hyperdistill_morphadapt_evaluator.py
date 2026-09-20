@@ -138,10 +138,11 @@ def _load_ob_rms(evaluator, checkpoint: Path):
 
 
 class _RecordingVecEnv:
-    def __init__(self, wrapped, records, identity):
+    def __init__(self, wrapped, records, identity, policy):
         self._wrapped = wrapped
         self._records = records
         self._identity = identity
+        self._policy = policy
         self._start_x = None
 
     def __getattr__(self, name):
@@ -161,6 +162,11 @@ class _RecordingVecEnv:
     def reset(self, *args, **kwargs):
         result = self._wrapped.reset(*args, **kwargs)
         self._capture_reset_x()
+        self._policy.bind_morphology(
+            raw_env=self._wrapped,
+            obs_mask=result["obs_padding_mask"],
+            act_mask=result["act_padding_mask"],
+        )
         return result
 
     def step(self, action):
@@ -244,7 +250,12 @@ def main() -> int:
 
     def recording_make(*make_args, **make_kwargs):
         env = original_make(*make_args, **make_kwargs)
-        return _RecordingVecEnv(env, records, {"walker_id": current["walker"], "eval_seed": current["seed"], "checkpoint_epoch": checkpoint_epoch})
+        return _RecordingVecEnv(
+            env,
+            records,
+            {"walker_id": current["walker"], "eval_seed": current["seed"], "checkpoint_epoch": checkpoint_epoch},
+            policy,
+        )
 
     def select_action(_model, obs, deterministic=True):
         return policy.action(obs)
